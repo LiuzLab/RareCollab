@@ -1,6 +1,6 @@
 ## Introduction
 
-**RareCollab** is a Python package for disease-gene diagnosis powered by **Ollama**. It integrates multimodal patient data, including **DNA**, **RNA**, and **phenotype** information, to support candidate gene prioritization and diagnostic interpretation.
+**RareCollab** is a Python package for rare diseases powered by **Ollama**. It integrates multimodal patient data, including **DNA**, **RNA**, and **phenotype** information, to support candidate variant prioritization and diagnostic interpretation.
 
 Our paper is available on **arXiv**: <https://arxiv.org/abs/2602.04058>
 
