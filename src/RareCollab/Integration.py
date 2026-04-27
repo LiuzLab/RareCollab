@@ -95,132 +95,595 @@ def TandemRepeatDetection(data, fa):
     return output_df
 
 
-def PairWiseComp(data, tier):
-    HPO_Score = {'Not Fit':1, 'Partial Fit':2, 'Good Fit':3, 'Stand-Alone Strong Evidence':4}
-    Db_Score = {'Against':0, 'Neutral':1, 'Supporting':2, 'Convincing':3}
-    RNA_Score = {"Strong RNA Evidence":2, "Weak RNA Evidence":1,}
+
+# -------------------------
+# Copeland pairwise majority voting
+# -------------------------
+PK_PHENO_SCORE = {
+    "not fit": 0,
+    "partial fit": 1,
+    "good fit": 2,
+    "strong": 3,
+}
+
+PK_CLINVAR_SCORE = {
+    "against": 0,
+    "neutral": 1,
+    "supporting": 2,
+    "convincing": 3,
+}
+
+PK_RNA_SCORE = {
+    "strong rna evidence": 2.0,
+    "weak rna evidence": 1.0,
+}
+
+PK_INSILICO_SCORE = {
+    "weak": 1.0,
+    "moderate": 2.0,
+    "strong": 3.0,
+}
 
 
-    comp_data = data[['varId','geneSymbol','Diagnostic_Engine_Rank','HPO_Conclusion','Database_Conclusion','RNA_GeneLevel_Conclusion','RNA_VarLevel_Conclusion','frame_shift','Insilico_Conclusion','partner']].copy()
-    comp_data = comp_data[data['Tier'].isin(tier)].reset_index(drop = True)
-    comp_data['HPO_Score'] = comp_data['HPO_Conclusion'].map(HPO_Score).fillna(0).astype(int)
-    comp_data['Db_Score'] = comp_data['Database_Conclusion'].map(Db_Score).fillna(1).astype(int)
+def _pk_norm(x):
+    """Normalize LLM labels used by the pairwise module."""
+    if x is None or pd.isna(x):
+        return ""
+    s = str(x).strip().lower().replace("_", " ").replace("-", " ")
+    s = " ".join(s.split())
 
-    comp_data['RNA_gene'] = comp_data['RNA_GeneLevel_Conclusion'].map(RNA_Score).fillna(0).astype(int)
-    comp_data['RNA_var'] = comp_data['RNA_VarLevel_Conclusion'].map(RNA_Score).fillna(0).astype(int)
-    comp_data['RNA_Score'] = comp_data[['RNA_gene', 'RNA_var']].max(axis=1)
+    if s in {"not fit", "no fit"}:
+        return "not fit"
+    if s in {"partial fit", "partially fit", "partial"}:
+        return "partial fit"
+    if s in {"good fit", "good"}:
+        return "good fit"
+    if s in {"stand alone strong evidence", "standalone strong evidence", "strong evidence", "strong"}:
+        return "strong"
 
-    comp_data['frame_shift'] = comp_data['frame_shift'].astype(int)
-    comp_data['Insilico_Score'] = (comp_data['Insilico_Conclusion'] == 'Strong').astype(int)
+    if s in {"against", "neutral", "supporting", "convincing"}:
+        return s
 
-    comp_data = comp_data.drop(columns = ['HPO_Conclusion','Database_Conclusion','RNA_GeneLevel_Conclusion','RNA_VarLevel_Conclusion','Insilico_Conclusion','RNA_gene','RNA_var'])
+    if s in {"strong rna evidence", "weak rna evidence", "no rna evidence", "no evidence"}:
+        return s
 
-    #Combine Paired Variants:
-    comp_dict = defaultdict(dict)
-    used = set()
-    score_cols = ['Diagnostic_Engine_Rank', 'frame_shift', 'HPO_Score', 'Db_Score', 'RNA_Score', 'Insilico_Score']
-    lookup = {}
-    for idx, row in comp_data.iterrows():
-        key = (row['geneSymbol'], row['varId'])
-        lookup[key] = idx
+    if s in {"weak", "moderate", "strong"}:
+        return s
 
-    for idx, row in comp_data.iterrows():
-        var1 = row['varId']
-        gene = row['geneSymbol']
-        partner = row['partner']
-        if (gene, partner) in used:
+    return s
+
+
+def _pk_to_bool(x):
+    if isinstance(x, bool):
+        return x
+    if x is None or pd.isna(x):
+        return False
+    return str(x).strip().lower() in {"true", "t", "1", "yes", "y"}
+
+
+def _pk_to_float(x, default=np.nan):
+    val = pd.to_numeric(x, errors="coerce")
+    if pd.isna(val):
+        return default
+    return float(val)
+
+
+def _pk_clean_str(x):
+    if x is None or pd.isna(x):
+        return ""
+    s = str(x).strip()
+    if s.lower() == "nan":
+        return ""
+    return s
+
+
+def _pk_best_rna_label(row):
+    gene_label = _pk_norm(row.get("RNA_GeneLevel_Conclusion", ""))
+    var_label = _pk_norm(row.get("RNA_VarLevel_Conclusion", ""))
+    gene_score = PK_RNA_SCORE.get(gene_label, 0.0)
+    var_score = PK_RNA_SCORE.get(var_label, 0.0)
+    if var_score > gene_score:
+        return var_label
+    if gene_score > 0:
+        return gene_label
+    if var_score > 0:
+        return var_label
+    return ""
+
+
+def _pk_metric_from_row(row):
+    rank = _pk_to_float(row.get("Diagnostic_Engine_Rank", np.nan), default=np.inf)
+    if not np.isfinite(rank):
+        rank = np.inf
+
+    pheno_label = _pk_norm(row.get("HPO_Conclusion", ""))
+    pheno_score = float(PK_PHENO_SCORE.get(pheno_label, 0))
+
+    clinvar_label = _pk_norm(row.get("Database_Conclusion", ""))
+    clinvar_score = float(PK_CLINVAR_SCORE.get(clinvar_label, 0))
+
+    rna_label = _pk_best_rna_label(row)
+    rna_score = float(PK_RNA_SCORE.get(rna_label, 0.0))
+
+    frameshift = int(_pk_to_bool(row.get("frame_shift", False)))
+
+    inheritance_match = _pk_to_float(row.get("inheritance_match", 1), default=1.0)
+    if pd.isna(inheritance_match):
+        inheritance_match = 1.0
+
+    insilico_label = _pk_norm(row.get("Insilico_Conclusion", ""))
+    insilico_rank = _pk_to_float(row.get("rank::InSilico", np.nan), default=np.inf)
+    if not np.isfinite(insilico_rank):
+        insilico_rank = np.inf
+
+    # Same gate as code2: in-silico only breaks ties when the in-silico
+    # expert ranked this candidate within the top 100.
+    if insilico_rank <= 100:
+        insilico_score = float(PK_INSILICO_SCORE.get(insilico_label, 0.0))
+    else:
+        insilico_score = 0.0
+
+    return {
+        "diag_rank": float(rank),
+        "pheno_label": pheno_label,
+        "pheno_score": pheno_score,
+        "clinvar_label": clinvar_label,
+        "clinvar_score": clinvar_score,
+        "rna_label": rna_label,
+        "rna_score": rna_score,
+        "frameshift": frameshift,
+        "inheritance_match": float(inheritance_match),
+        "insilico_label": insilico_label,
+        "insilico_rank": float(insilico_rank),
+        "insilico_score": insilico_score,
+    }
+
+
+def _pk_compound_mean_metrics(member_metrics):
+    """Compound-vs-compound uses the mean of member-variant metrics."""
+    if len(member_metrics) == 1:
+        return member_metrics[0]
+
+    diag_vals = [m["diag_rank"] for m in member_metrics if np.isfinite(m["diag_rank"])]
+    diag_rank_mean = float(np.mean(diag_vals)) if diag_vals else np.inf
+
+    return {
+        "diag_rank": diag_rank_mean,
+        "pheno_label": "mean(" + ",".join(sorted(set(str(m["pheno_label"]) for m in member_metrics))) + ")",
+        "pheno_score": float(np.mean([m["pheno_score"] for m in member_metrics])),
+        "clinvar_label": "mean(" + ",".join(sorted(set(str(m["clinvar_label"]) for m in member_metrics))) + ")",
+        "clinvar_score": float(np.mean([m["clinvar_score"] for m in member_metrics])),
+        "rna_label": "mean(" + ",".join(sorted(set(str(m["rna_label"]) for m in member_metrics))) + ")",
+        "rna_score": float(np.mean([m["rna_score"] for m in member_metrics])),
+        "frameshift": float(np.mean([m["frameshift"] for m in member_metrics])),
+        "inheritance_match": float(np.mean([m["inheritance_match"] for m in member_metrics])),
+        "insilico_label": "mean(" + ",".join(sorted(set(str(m["insilico_label"]) for m in member_metrics))) + ")",
+        "insilico_rank": float(np.min([m["insilico_rank"] for m in member_metrics if pd.notna(m["insilico_rank"])])) if any(pd.notna(m["insilico_rank"]) for m in member_metrics) else np.inf,
+        "insilico_score": float(np.mean([m["insilico_score"] for m in member_metrics])),
+    }
+
+
+def _pk_pick_stronger_member(member_ids, variant_metrics):
+    """Compound-vs-single uses the stronger member of the compound entity."""
+    best_vid = None
+    best_key = None
+    for vid in member_ids:
+        m = variant_metrics[vid]
+        key = (
+            float(m["diag_rank"]),
+            -float(m["pheno_score"]),
+            -float(m["clinvar_score"]),
+            -float(m["rna_score"]),
+            -float(m["inheritance_match"]),
+            -float(m["frameshift"]),
+            str(vid),
+        )
+        if best_key is None or key < best_key:
+            best_key = key
+            best_vid = vid
+    return best_vid, variant_metrics[best_vid]
+
+
+def _pk_criterion_vote(a_val, b_val, lower_is_better=False):
+    if pd.isna(a_val) and pd.isna(b_val):
+        return "tie"
+    if pd.isna(a_val):
+        return "B"
+    if pd.isna(b_val):
+        return "A"
+
+    if lower_is_better:
+        if a_val < b_val:
+            return "A"
+        if b_val < a_val:
+            return "B"
+        return "tie"
+
+    if a_val > b_val:
+        return "A"
+    if b_val > a_val:
+        return "B"
+    return "tie"
+
+
+def _pk_compare(metrics_a, metrics_b):
+    """
+    Code2-consistent Copeland majority voting:
+    primary votes are diagnostic rank, phenotype, database, RNA,
+    inheritance match and frameshift. In-silico is used only as a tie-breaker;
+    if still tied, diagnostic rank breaks the tie.
+    """
+    rank_vote = _pk_criterion_vote(float(metrics_a["diag_rank"]), float(metrics_b["diag_rank"]), lower_is_better=True)
+    pheno_vote = _pk_criterion_vote(float(metrics_a.get("pheno_score", 0.0)), float(metrics_b.get("pheno_score", 0.0)))
+    clinvar_vote = _pk_criterion_vote(float(metrics_a.get("clinvar_score", 0.0)), float(metrics_b.get("clinvar_score", 0.0)))
+    rna_vote = _pk_criterion_vote(float(metrics_a.get("rna_score", 0.0)), float(metrics_b.get("rna_score", 0.0)))
+    inheritance_vote = _pk_criterion_vote(float(metrics_a.get("inheritance_match", 1.0)), float(metrics_b.get("inheritance_match", 1.0)))
+    frameshift_vote = _pk_criterion_vote(float(metrics_a.get("frameshift", 0)), float(metrics_b.get("frameshift", 0)))
+
+    primary_votes = [rank_vote, pheno_vote, clinvar_vote, rna_vote, inheritance_vote, frameshift_vote]
+    votes_a = sum(v == "A" for v in primary_votes)
+    votes_b = sum(v == "B" for v in primary_votes)
+    votes_tie = sum(v == "tie" for v in primary_votes)
+
+    insilico_vote = "not_used"
+    tie_reason = ""
+
+    if votes_a > votes_b:
+        winner = "A"
+    elif votes_b > votes_a:
+        winner = "B"
+    else:
+        insilico_vote = _pk_criterion_vote(
+            float(metrics_a.get("insilico_score", 0.0)),
+            float(metrics_b.get("insilico_score", 0.0)),
+        )
+        if insilico_vote == "A":
+            winner = "A"
+            tie_reason = "tie_break_by_insilico"
+        elif insilico_vote == "B":
+            winner = "B"
+            tie_reason = "tie_break_by_insilico"
+        else:
+            rank_a = float(metrics_a["diag_rank"])
+            rank_b = float(metrics_b["diag_rank"])
+            if rank_a < rank_b:
+                winner = "A"
+                tie_reason = "tie_break_by_rank"
+            elif rank_b < rank_a:
+                winner = "B"
+                tie_reason = "tie_break_by_rank"
+            else:
+                winner = "tie"
+                tie_reason = "full_tie"
+
+    return {
+        "votes_A": votes_a,
+        "votes_B": votes_b,
+        "votes_tie": votes_tie,
+        "winner": winner,
+        "tie_breaker": tie_reason,
+        "rank_point": rank_vote,
+        "pheno_level_point": pheno_vote,
+        "clinvar_point": clinvar_vote,
+        "rna_point": rna_vote,
+        "inheritance_point": inheritance_vote,
+        "frameshift_point": frameshift_vote,
+        "insilico_point": insilico_vote,
+    }
+
+
+def _pk_build_compound_group_ids(vdf, sampleid=""):
+    """Build pair-specific compound-het entity IDs from the partner column."""
+    vdf = vdf.copy()
+    vdf["compound_het_group_id"] = ""
+    if "partner" not in vdf.columns or vdf.empty:
+        return vdf
+
+    valid_keys = set(zip(vdf["geneSymbol"].astype(str), vdf["varId"].astype(str)))
+    for idx, row in vdf.iterrows():
+        gene = str(row.get("geneSymbol", ""))
+        vid = str(row.get("varId", ""))
+        partner = _pk_clean_str(row.get("partner", ""))
+        if partner == "":
             continue
-        if partner != '':
-            partner_idx = lookup[(gene, partner)]
-            partner_row = comp_data.loc[partner_idx]
-            key = (gene, var1, partner)
-            comp_dict[key] = {col: [int(row[col]), int(partner_row[col])] for col in score_cols}
-            comp_dict[key]['paired'] = True
-            comp_dict[key]['Wins'] = 0 
-            used.add((gene, var1))
-            used.add((gene, partner))
+        if (gene, partner) not in valid_keys:
+            continue
+        pair = sorted([vid, partner])
+        gid = f"{sampleid}|{gene.upper()}|CH|{pair[0]}|{pair[1]}"
+        vdf.at[idx, "compound_het_group_id"] = gid
+    return vdf
+
+
+def PairWiseComp(data, tier=(1, 2), sampleid=""):
+    """
+    Code2-consistent entity-level Copeland pairwise majority voting.
+
+    Compound handling follows code2:
+    - single vs single: compare the single variants directly
+    - compound vs single: represent the compound by its stronger member
+    - compound vs compound: compare mean metrics across constituent variants
+
+    Returns
+    -------
+    res_df : pd.DataFrame
+        Per-variant pairwise scores and entity metadata for variants in `tier`.
+    pk_log_df : pd.DataFrame
+        Pairwise-comparison log for auditing/debugging.
+    """
+    if data is None or data.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    df = data.copy()
+    if "Tier" not in df.columns:
+        df["Tier"] = np.nan
+    df["TierNum"] = pd.to_numeric(df["Tier"], errors="coerce")
+
+    tier_set = {int(x) for x in tier}
+    vdf = df[df["TierNum"].isin([float(x) for x in tier_set])].copy()
+    if vdf.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    defaults = {
+        "varId": "",
+        "geneSymbol": "",
+        "Diagnostic_Engine_Rank": np.inf,
+        "HPO_Conclusion": "",
+        "Database_Conclusion": "",
+        "RNA_GeneLevel_Conclusion": "",
+        "RNA_VarLevel_Conclusion": "",
+        "frame_shift": False,
+        "Insilico_Conclusion": "",
+        "rank::InSilico": np.inf,
+        "inheritance_match": 1,
+        "partner": "",
+        "HGVSc": "",
+        "HGVSp": "",
+    }
+    for col, default in defaults.items():
+        if col not in vdf.columns:
+            vdf[col] = default
+
+    vdf["varId"] = vdf["varId"].astype(str)
+    vdf["geneSymbol"] = vdf["geneSymbol"].astype(str)
+    vdf = vdf.drop_duplicates(subset=["geneSymbol", "varId"], keep="first").reset_index(drop=True)
+    vdf = _pk_build_compound_group_ids(vdf, sampleid=sampleid)
+
+    variant_metrics = {}
+    variant_rows = {}
+    variant_member_sort_keys = {}
+    for _, row in vdf.iterrows():
+        vid = str(row["varId"])
+        metric = _pk_metric_from_row(row)
+        variant_metrics[vid] = metric
+        variant_rows[vid] = row
+        variant_member_sort_keys[vid] = (
+            float(metric["diag_rank"]),
+            -float(metric["pheno_score"]),
+            -float(metric["clinvar_score"]),
+            -float(metric["rna_score"]),
+            -float(metric["inheritance_match"]),
+            -float(metric["frameshift"]),
+            vid,
+        )
+
+    entities = []
+    used_variants = set()
+
+    grouped = vdf[vdf["compound_het_group_id"].astype(str).str.strip().ne("")]
+    for gid, gmem in grouped.groupby("compound_het_group_id", sort=False):
+        mem_ids = gmem["varId"].astype(str).tolist()
+        mem_ids = [vid for vid in mem_ids if vid in variant_metrics]
+        if len(set(mem_ids)) < 2:
+            continue
+        mem_ids = list(dict.fromkeys(mem_ids))
+        used_variants.update(mem_ids)
+        entities.append({
+            "entity_id": f"COMPOUND::{gid}",
+            "entity_type": "compound",
+            "compound_het_group_id": gid,
+            "member_variant_ids": mem_ids,
+            "members_df": gmem.copy(),
+        })
+
+    singles = vdf[~vdf["varId"].astype(str).isin(used_variants)].copy()
+    for _, row in singles.iterrows():
+        vid = str(row["varId"])
+        entities.append({
+            "entity_id": f"SINGLE::{sampleid}::{vid}",
+            "entity_type": "single",
+            "compound_het_group_id": "",
+            "member_variant_ids": [vid],
+            "members_df": pd.DataFrame([row]),
+        })
+
+    if len(entities) == 0:
+        return pd.DataFrame(), pd.DataFrame()
+
+    entity_by_id = {e["entity_id"]: e for e in entities}
+    entity_metrics = {}
+    entity_stronger_metrics = {}
+    entity_stronger_member_id = {}
+    entity_rank_for_sort = {}
+    entity_member_order = {}
+    entity_meta = {}
+
+    for entity in entities:
+        eid = entity["entity_id"]
+        member_ids = [str(x) for x in entity["member_variant_ids"]]
+        member_metrics = [variant_metrics[vid] for vid in member_ids]
+
+        if entity["entity_type"] == "single":
+            mean_metric = member_metrics[0]
+            stronger_vid = member_ids[0]
+            stronger_metric = member_metrics[0]
         else:
-            key = (gene, var1)
-            comp_dict[key] = {col: [row[col]] for col in score_cols}
-            comp_dict[key]['paired'] = False
-            comp_dict[key]['Wins'] = 0 
-            used.add(key)
+            mean_metric = _pk_compound_mean_metrics(member_metrics)
+            stronger_vid, stronger_metric = _pk_pick_stronger_member(member_ids, variant_metrics)
 
-    for (key1, val1), (key2, val2) in combinations(comp_dict.items(), 2):
-        S1 = S2 = 0    
-        if val1['paired'] == True and val2['paired'] == True:
-            DE_rank_1,DE_rank_2 = sum(val1['Diagnostic_Engine_Rank'])/2, sum(val2['Diagnostic_Engine_Rank'])/2
-            HPO_1, HPO_2 = sum(val1['HPO_Score'])/2, sum(val2['HPO_Score'])/2
-            DB_1, DB_2 = sum(val1['Db_Score'])/2, sum(val2['Db_Score'])/2
-            RNA_1, RNA_2 = max(val1['RNA_Score']), max(val2['RNA_Score'])
-            FS_1, FS_2 = max(val1['frame_shift']), max(val2['frame_shift'])
-            IS_1, IS_2 = max(val1['Insilico_Score']), max(val2['Insilico_Score'])
-        else:
-            DE_rank_1,DE_rank_2 = min(val1['Diagnostic_Engine_Rank']), min(val2['Diagnostic_Engine_Rank'])
-            HPO_1, HPO_2 = max(val1['HPO_Score']), max(val2['HPO_Score'])
-            DB_1, DB_2 = max(val1['Db_Score']), max(val2['Db_Score'])
-            RNA_1, RNA_2 = max(val1['RNA_Score']), max(val2['RNA_Score'])
-            FS_1, FS_2 = max(val1['frame_shift']), max(val2['frame_shift'])
-            IS_1, IS_2 = max(val1['Insilico_Score']), max(val2['Insilico_Score'])      
-        #DE:
-        if DE_rank_1 < DE_rank_2:
-            S1 += 1
-        elif DE_rank_1 > DE_rank_2:
-            S2 += 1
-        #HPO:
-        if HPO_1 > HPO_2:
-            S1 += 1
-        elif HPO_1 < HPO_2:
-            S2 += 1
-        if HPO_1 >= 3 and HPO_2 <= 1:
-            S1 += 2
-        elif HPO_2 >= 3 and HPO_1 <= 1:
-            S2 += 2
-        #DataBase
-        if DB_1 >= 2 and DB_2 <= 1:
-            S1 += 1
-        elif DB_2 >= 2 and DB_1 <= 1:
-            S2 += 1
-        #RNA:
-        if RNA_1 > RNA_2:
-            S1 += 1
-        elif RNA_1 < RNA_2:
-            S2 += 1
-        if RNA_1 >= 2 and RNA_2 < 2:
-            S1 += 1
-        elif RNA_2 >= 2 and RNA_1 < 2:
-            S2 += 1
-        #Frameshift
-        if FS_1 == 1 and FS_2 == 0:
-            S1 += 1
-        elif FS_2 == 1 and FS_1 == 0:
-            S2 += 1
-        #In-silico:
-        if IS_1 == 1 and IS_2 == 0:
-            S1 += 1
-        elif IS_2 == 1 and IS_1 == 0:
-            S2 += 1
+        entity_metrics[eid] = mean_metric
+        entity_stronger_metrics[eid] = stronger_metric
+        entity_stronger_member_id[eid] = stronger_vid
+        entity_rank_for_sort[eid] = float(mean_metric["diag_rank"])
+        entity_member_order[eid] = sorted(member_ids, key=lambda vid: variant_member_sort_keys[vid])
 
-        if S1 > S2:
-            comp_dict[key1]['Wins'] += 1
-        elif S2 > S1:
-            comp_dict[key2]['Wins'] += 1
-        else:
-            if DE_rank_1 > DE_rank_2:
-                comp_dict[key1]['Wins'] += 1
-            elif DE_rank_1 < DE_rank_2:
-                comp_dict[key2]['Wins'] += 1
+        members_df = entity["members_df"]
+        entity_meta[eid] = {
+            "entity_id": eid,
+            "entity_type": entity["entity_type"],
+            "compound_het_group_id": entity["compound_het_group_id"],
+            "member_variant_ids": "|".join(member_ids),
+            "geneSymbol_set": "|".join(sorted(set(members_df["geneSymbol"].astype(str).tolist()))),
+            "HGVSc_set": "|".join(sorted(set(members_df["HGVSc"].astype(str).tolist()))) if "HGVSc" in members_df.columns else "",
+            "HGVSp_set": "|".join(sorted(set(members_df["HGVSp"].astype(str).tolist()))) if "HGVSp" in members_df.columns else "",
+        }
 
-    tmp_rows = []
-    for key, val in comp_dict.items():
-        gene = key[0]
-        var_ids = key[1:]
-        wins = val['Wins']
+    ent_ids = [e["entity_id"] for e in entities]
+    win = {eid: 0 for eid in ent_ids}
+    loss = {eid: 0 for eid in ent_ids}
+    tie_count = {eid: 0 for eid in ent_ids}
+    pk_logs = []
 
-        for var_id in var_ids:
-            tmp_rows.append({'geneSymbol': gene, 'varId': var_id, 'PairWiseScore': wins})
-    res_df = pd.DataFrame(tmp_rows)
-    return res_df
+    for i in range(len(ent_ids)):
+        eid_a = ent_ids[i]
+        ent_a = entity_by_id[eid_a]
+        meta_a = entity_meta[eid_a]
+
+        for j in range(i + 1, len(ent_ids)):
+            eid_b = ent_ids[j]
+            ent_b = entity_by_id[eid_b]
+            meta_b = entity_meta[eid_b]
+
+            if ent_a["entity_type"] == "single":
+                met_a = entity_metrics[eid_a]
+                used_mode_a = "single"
+                used_member_a = entity_stronger_member_id[eid_a]
+            else:
+                if ent_b["entity_type"] == "single":
+                    met_a = entity_stronger_metrics[eid_a]
+                    used_mode_a = "compound_stronger_member"
+                    used_member_a = entity_stronger_member_id[eid_a]
+                else:
+                    met_a = entity_metrics[eid_a]
+                    used_mode_a = "compound_mean"
+                    used_member_a = "|".join(ent_a["member_variant_ids"])
+
+            if ent_b["entity_type"] == "single":
+                met_b = entity_metrics[eid_b]
+                used_mode_b = "single"
+                used_member_b = entity_stronger_member_id[eid_b]
+            else:
+                if ent_a["entity_type"] == "single":
+                    met_b = entity_stronger_metrics[eid_b]
+                    used_mode_b = "compound_stronger_member"
+                    used_member_b = entity_stronger_member_id[eid_b]
+                else:
+                    met_b = entity_metrics[eid_b]
+                    used_mode_b = "compound_mean"
+                    used_member_b = "|".join(ent_b["member_variant_ids"])
+
+            res = _pk_compare(met_a, met_b)
+            if res["winner"] == "A":
+                win[eid_a] += 1
+                loss[eid_b] += 1
+            elif res["winner"] == "B":
+                win[eid_b] += 1
+                loss[eid_a] += 1
+            else:
+                tie_count[eid_a] += 1
+                tie_count[eid_b] += 1
+
+            pk_logs.append({
+                "sample_id": sampleid,
+                "PK_TierGroup": "+".join(str(x) for x in sorted(tier_set)),
+                "A_entity_id": meta_a["entity_id"],
+                "A_entity_type": meta_a["entity_type"],
+                "A_compound_het_group_id": meta_a["compound_het_group_id"],
+                "A_member_variant_ids": meta_a["member_variant_ids"],
+                "A_geneSymbol_set": meta_a["geneSymbol_set"],
+                "A_HGVSc_set": meta_a["HGVSc_set"],
+                "A_HGVSp_set": meta_a["HGVSp_set"],
+                "A_used_mode": used_mode_a,
+                "A_used_member_variant_id": used_member_a,
+                "A_diag_rank": met_a["diag_rank"],
+                "A_pheno_label": met_a["pheno_label"],
+                "A_pheno_score": met_a["pheno_score"],
+                "A_clinvar_label": met_a.get("clinvar_label", ""),
+                "A_clinvar_score": met_a.get("clinvar_score", 0.0),
+                "A_rna_label": met_a.get("rna_label", ""),
+                "A_rna_score": met_a.get("rna_score", 0.0),
+                "A_inheritance_match": met_a.get("inheritance_match", 1.0),
+                "A_frameshift": met_a.get("frameshift", 0),
+                "A_insilico_label": met_a.get("insilico_label", ""),
+                "A_insilico_score": met_a.get("insilico_score", 0.0),
+                "B_entity_id": meta_b["entity_id"],
+                "B_entity_type": meta_b["entity_type"],
+                "B_compound_het_group_id": meta_b["compound_het_group_id"],
+                "B_member_variant_ids": meta_b["member_variant_ids"],
+                "B_geneSymbol_set": meta_b["geneSymbol_set"],
+                "B_HGVSc_set": meta_b["HGVSc_set"],
+                "B_HGVSp_set": meta_b["HGVSp_set"],
+                "B_used_mode": used_mode_b,
+                "B_used_member_variant_id": used_member_b,
+                "B_diag_rank": met_b["diag_rank"],
+                "B_pheno_label": met_b["pheno_label"],
+                "B_pheno_score": met_b["pheno_score"],
+                "B_clinvar_label": met_b.get("clinvar_label", ""),
+                "B_clinvar_score": met_b.get("clinvar_score", 0.0),
+                "B_rna_label": met_b.get("rna_label", ""),
+                "B_rna_score": met_b.get("rna_score", 0.0),
+                "B_inheritance_match": met_b.get("inheritance_match", 1.0),
+                "B_frameshift": met_b.get("frameshift", 0),
+                "B_insilico_label": met_b.get("insilico_label", ""),
+                "B_insilico_score": met_b.get("insilico_score", 0.0),
+                "votes_A": res["votes_A"],
+                "votes_B": res["votes_B"],
+                "votes_tie": res["votes_tie"],
+                "rank_point": res["rank_point"],
+                "pheno_level_point": res["pheno_level_point"],
+                "clinvar_point": res["clinvar_point"],
+                "rna_point": res["rna_point"],
+                "inheritance_point": res["inheritance_point"],
+                "frameshift_point": res["frameshift_point"],
+                "insilico_point": res["insilico_point"],
+                "winner": res["winner"],
+                "tie_breaker": res["tie_breaker"],
+            })
+
+    copeland_score = {eid: win[eid] - loss[eid] for eid in ent_ids}
+    ordered_entities = sorted(
+        ent_ids,
+        key=lambda eid: (
+            -copeland_score[eid],
+            -win[eid],
+            loss[eid],
+            entity_rank_for_sort.get(eid, np.inf),
+            eid,
+        ),
+    )
+
+    rows = []
+    for entity_rank, eid in enumerate(ordered_entities, start=1):
+        entity = entity_by_id[eid]
+        member_ids = entity_member_order[eid]
+        for within_rank, vid in enumerate(member_ids, start=1):
+            source_row = variant_rows[vid]
+            rows.append({
+                "geneSymbol": source_row.get("geneSymbol", ""),
+                "varId": vid,
+                "PairWiseScore": copeland_score[eid],
+                "PairWiseWins": win[eid],
+                "PairWiseLosses": loss[eid],
+                "PairWiseTies": tie_count[eid],
+                "PairWiseEntityRank": entity_rank,
+                "PairWiseWithinEntityRank": within_rank,
+                "pairwise_entity_id": eid,
+                "pairwise_entity_type": entity["entity_type"],
+                "compound_het_group_id": entity["compound_het_group_id"],
+            })
+
+    res_df = pd.DataFrame(rows)
+    pk_log_df = pd.DataFrame(pk_logs)
+    return res_df, pk_log_df
 
 def Review(work_path, reference_genome, output_path):
     input_root_nomcand = work_path + "/Diagnostic_results/Candidates/"
@@ -239,6 +702,9 @@ def Review(work_path, reference_genome, output_path):
     database_res = load_DatabaseLLM_res(input_root_database)
     sample_ids = [p.name.split("_nomcand.feather")[0] for p in Path(input_root_nomcand).iterdir()]
     
+    Path(output_path).mkdir(parents=True, exist_ok=True)
+    pairwise_pk_logs = []
+
     print(f"Reviewing Cases - Pairwise Comparison")
     pbar = tqdm(sample_ids, desc="Reviewing Cases", total=len(sample_ids))
     for sampleid in pbar:
@@ -360,7 +826,11 @@ def Review(work_path, reference_genome, output_path):
                     data.loc[partner_j, 'partner'] = data.loc[i, 'varId']
                     data.loc[partner_j, 'Tier'] = data.loc[i, 'Tier']
                 
-        #reorder:
+        # Reorder variants that are incompatible with the expected inheritance pattern.
+        # This value is also used as one of the primary votes in the code2-style
+        # pairwise majority voting.
+        data['inheritance_match'] = 1
+
         for i in range(len(data)):
             zyg_ok = data.loc[i, "Database_Zygosity"] in {"homozygous", "compound heterozygous", "compound_heterozygous"}
             if ((data.loc[i, 'zyg'] == 1) & 
