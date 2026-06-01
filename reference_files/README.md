@@ -1,1 +1,1 @@
-These are the reference files for download.
+Reference file for RNA data. Will be removed in later development.

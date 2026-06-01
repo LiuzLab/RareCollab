@@ -3,11 +3,12 @@
 
 import time
 import requests
+import os
 import pandas as pd
 from pathlib import Path
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm.notebook import tqdm
+from tqdm import tqdm
 import pickle
 import json
 
@@ -110,137 +111,218 @@ Output MUST be valid JSON on a single line. No markdown. No code fences. No extr
 """
   return prompt
 
-def database_process_one(varId, vid, clinvar_submission_path, params, url, max_try, truncate) -> None:
-    save_file = Path(clinvar_submission_path + "/" + varId + ".pkl")
-    if save_file.exists():
+def database_process_one(varId, vid, clinvar_submissions_dir, params,
+                         url, max_try, truncate, overwrite=False):
+    """Fetch ClinVar submission XML for one variant. Atomic write."""
+    output_path = clinvar_submissions_dir / f"{varId}.pkl"
+    if output_path.exists() and not overwrite:
         return 1
+    
+    params = dict(params)  # don't mutate caller's dict
     params['id'] = str(vid)
-    #Call NCBI API:
-    cal = Call_NCBI_API(url = url, params = params, max_try = max_try)
+    
+    cal = Call_NCBI_API(url=url, params=params, max_try=max_try)
     if cal is None:
-        print(f"Variant - {varId} - with id:{vid} NOT found on NCBI - Skip")
         return 0
-    else:
-        #Curate the information:
-        blocks = []
-        for cas in cal.findall("./ClinicalAssertion"):
-            lines = _element_to_lines(cas, depth=0)
-            block = "\n".join(lines)
-            if truncate and len(block) > truncate:
-                block = block[:truncate] + "..."
-            blocks.append(block)
-        with open(save_file, "wb") as f:
-            pickle.dump(blocks, f, protocol=pickle.HIGHEST_PROTOCOL)
-        return 1
+    
+    blocks = []
+    for cas in cal.findall("./ClinicalAssertion"):
+        lines = _element_to_lines(cas, depth=0)
+        block = "\n".join(lines)
+        if truncate and len(block) > truncate:
+            block = block[:truncate] + "..."
+        blocks.append(block)
+    
+    tmp = clinvar_submissions_dir / f".{varId}.pkl.tmp"
+    with open(tmp, "wb") as f:
+        pickle.dump(blocks, f, protocol=pickle.HIGHEST_PROTOCOL)
+    os.replace(tmp, output_path)
+    return 1
 
-def call_ollama_one(MODEL_NAME, OLLAMA_URL, TEMPERATURE, LLM_res_path, clinvar_submission_path, varId, HGVSc_core):
-    output_txt_path = LLM_res_path + '/txt/' + varId + '.txt'
-    output_json_path = LLM_res_path + '/json/' + varId + '.json'
-    if Path(output_json_path).exists():
+def call_ollama_one(model_name, ollama_url, temperature,
+                    llm_res_dir, clinvar_submissions_dir,
+                    varId, HGVSc_core, overwrite=False):
+    """Call LLM for one variant. Atomic write of both txt and json outputs."""
+    output_txt = llm_res_dir / "txt" / f"{varId}.txt"
+    output_json = llm_res_dir / "json" / f"{varId}.json"
+    if output_json.exists() and not overwrite:
         return 1
-    with open(f"{clinvar_submission_path}/{varId}.pkl", "rb") as f: block = pickle.load(f)
-    prompt_text = build_prompt_en(var_key = varId, HGVSc_core = HGVSc_core, preview_blocks = block)
-    url = f"{OLLAMA_URL.rstrip('/')}/api/generate"
+    
+    pkl_path = clinvar_submissions_dir / f"{varId}.pkl"
+    if not pkl_path.exists():
+        # Upstream NCBI fetch missed this variant; skip
+        return 0
+    
+    with open(pkl_path, "rb") as f:
+        block = pickle.load(f)
+    
+    prompt_text = build_prompt_en(var_key=varId, HGVSc_core=HGVSc_core, preview_blocks=block)
     payload = {
-        "model": MODEL_NAME,
+        "model": model_name,
         "prompt": prompt_text,
         "stream": False,
-        "options": {"temperature": float(TEMPERATURE)},
+        "options": {"temperature": float(temperature)},
     }
-    r = requests.post(url, json=payload, timeout=600)
+    r = requests.post(f"{ollama_url.rstrip('/')}/api/generate", json=payload, timeout=600)
     r.raise_for_status()
     data = r.json()
     llm_output = data.get("response", "").strip()
     obj = json.loads(llm_output)
-    conclusion = obj['conclusion']if 'conclusion' in obj else 'Neutral'
-    zygosity = obj['zygosity']if 'zygosity' in obj else 'no information'
-    reasoning_line = obj['reasoning']if 'reasoning' in obj else 'Parsed fields using relaxed rules; missing/invalid fields defaulted conservatively.'
+    
+    conclusion = obj.get('conclusion', 'Neutral')
+    zygosity = obj.get('zygosity', 'no information')
+    reasoning_line = obj.get('reasoning',
+        'Parsed fields using relaxed rules; missing/invalid fields defaulted conservatively.')
     final_text = f"{reasoning_line}\nConclusion: {conclusion}\nZygosity: {zygosity}\n"
-    Path(output_txt_path).write_text(final_text, encoding="utf-8")
-    with Path(output_json_path).open("w", encoding="utf-8") as f: json.dump(obj, f)
+    
+    # Atomic write txt
+    tmp_txt = output_txt.parent / f".{output_txt.name}.tmp"
+    tmp_txt.write_text(final_text, encoding="utf-8")
+    os.replace(tmp_txt, output_txt)
+    
+    # Atomic write json
+    tmp_json = output_json.parent / f".{output_json.name}.tmp"
+    obj.setdefault('reasoning', 'parse_error')
+    obj.setdefault('conclusion', 'Neutral')
+    obj.setdefault('zygosity', 'no information')
+    with tmp_json.open("w", encoding="utf-8") as f:
+        json.dump(obj, f)
+    os.replace(tmp_json, output_json)
+    
     return 1
 
-def clinvar_process_one(sample_id, sample_path, output_path, ClinVar) -> None:
-    save_file = Path(output_path + '/' + sample_id + '.feather')
-    if save_file.exists():
+def clinvar_process_one(sample_id, candidates_path, output_path, ClinVar, overwrite=False):
+    """Filter one sample's candidates by ClinVar membership. Atomic write."""
+    if output_path.exists() and not overwrite:
         return 1
-    data = pd.read_feather(sample_path, columns = ['varId','HGVSc_core'])
-    data = data.merge(ClinVar, on = 'varId', how = 'inner')
-    data.to_feather(save_file)
+    
+    data = pd.read_feather(candidates_path, columns=['varId', 'HGVSc_core'])
+    data = data.merge(ClinVar, on='varId', how='inner')
+    
+    tmp = output_path.parent / f".{output_path.name}.tmp"
+    data.to_feather(tmp)
+    os.replace(tmp, output_path)
     return 1
 
-def RunAgent(work_path, ClinVar_path, NCBI_EMAIL, NCBI_KEY, MODEL_NAME, OLLAMA_URL, TEMPERATURE, max_workers = 5):
+def RunAgent(samplesheet, work_dir, references, llm_config,
+             ncbi_email=None, ncbi_api_key=None,
+             config=None, overwrite=False):
+    """
+    Run DNA Database Agent: filter candidates with ClinVar submissions,
+    fetch ClinVar evidence from NCBI, and evaluate using LLM.
+    
+    Pipeline:
+      1. Filter candidates by ClinVar membership (per sample)
+      2. Merge ClinVar-relevant variants across samples (dedup)
+      3. Fetch ClinVar submission XML from NCBI API
+      4. Evaluate each variant's evidence with LLM (ollama)
+    
+    Args:
+        samplesheet: Must contain sampleID + candidates_path columns.
+        work_dir: Pipeline work directory.
+        references: AimReferences (uses references.rarecollab.clinvar_feather).
+        llm_config: Dict with keys model_name, ollama_url, temperature.
+        ncbi_email: NCBI account email (optional, increases rate limit).
+        ncbi_api_key: NCBI API key (optional, increases rate limit).
+        config: Optional worker config dict.
+        overwrite: Re-run even if outputs exist.
+    """
+    default_config = {"database_clinvar_filter_workers": 1}
+    cfg = {**default_config, **(config or {})}
+    
+    work_dir = Path(work_dir)
+    
+    if "candidates_path" not in samplesheet.columns:
+        raise ValueError(
+            "samplesheet missing 'candidates_path' column. "
+            "Run DiagnosticEngine.Candidates first."
+        )
+    
+    # Output dirs
+    output_root = work_dir / "Agents" / "Database"
+    clinvar_filtered_dir = output_root / "ClinVarFiltered"
+    clinvar_submissions_dir = output_root / "ClinVarVariants"
+    llm_res_dir = output_root / "AgentEvaluation"
+    
+    for d in [clinvar_filtered_dir, clinvar_submissions_dir,
+              llm_res_dir / "txt", llm_res_dir / "json"]:
+        d.mkdir(parents=True, exist_ok=True)
+    
+    # NCBI request params
     url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
-    TOOL = "clinvar_submissions_fetcher"
-    truncate = 3000
-    max_try = 3
-    params = {"db": "clinvar",
-            "rettype": "vcv",
-            "retmode": "xml",
-            "is_variationid":"true",
-            "tool": TOOL, 
-            "email": NCBI_EMAIL,
-            "api_key": NCBI_KEY}
+    params = {
+        "db": "clinvar", "rettype": "vcv", "retmode": "xml",
+        "is_variationid": "true",
+        "tool": "clinvar_submissions_fetcher",
+    }
+    if ncbi_email:
+        params["email"] = ncbi_email
+    if ncbi_api_key:
+        params["api_key"] = ncbi_api_key
     
-    output_path = work_path + "/Agents/Database/"
-    ClinVarVariants_path = output_path + 'ClinVarVariants/'
-    ClinVarFiltered_path = output_path + 'ClinVarFiltered/'
-    LLM_res_path = output_path + 'AgentEvaluation/'
+    NCBI_WORKERS = 2  # NCBI rate limit
+    LLM_WORKERS = llm_config.get("num_parallel", 1)   # match OLLAMA_NUM_PARALLEL
+    MAX_TRY = 3
+    TRUNCATE = 3000
     
-    #Creat root path:
-    print(f"Creating work dir ~{Path(output_path)}")
-    Path(output_path).mkdir(parents=True, exist_ok=True)
-    Path(ClinVarVariants_path).mkdir(parents=True, exist_ok=True)
-    Path(ClinVarFiltered_path).mkdir(parents=True, exist_ok=True)
-    Path(LLM_res_path).mkdir(parents=True, exist_ok=True)
-    Path(LLM_res_path + 'txt').mkdir(parents=True, exist_ok=True)
-    Path(LLM_res_path + 'json').mkdir(parents=True, exist_ok=True)
-
-    #1.Filter Candidates with ClinVar submissions:
-    print(f"Loading ClinVar Documents ...")
-    ClinVar = pd.read_feather(ClinVar_path)
-    input_path = work_path + '/Diagnostic_results/Candidates/'
-    if not Path(input_path).exists():
-        raise ValueError(f"Input file NOT detected, please run 'DiagnosticEngine.Candidates' first and check the work_path ... ")
-    SampleID_Path = {p.name.split('_nomcand.feather')[0]: p for p in Path(input_path).iterdir()}
-    #Process samples in parallel:
-    print(f'Sample Processing ...')
-    futures = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for sample_id, sample_path in SampleID_Path.items():
-            futures.append(ex.submit(clinvar_process_one, sample_id, sample_path, ClinVarFiltered_path, ClinVar))
+    # ===== Step 1: Filter candidates by ClinVar =====
+    print("1. Filtering candidates by ClinVar membership ...")
+    ClinVar = pd.read_feather(references.rarecollab.clinvar_feather)
+    
+    output_paths = {}
+    futures_map = {}
+    
+    with ThreadPoolExecutor(max_workers=cfg["database_clinvar_filter_workers"]) as ex:
+        for row in samplesheet.itertuples(index=True):
+            sample_id = row.sampleID
+            candidates_path = Path(row.candidates_path)
+            output_path = clinvar_filtered_dir / f"{sample_id}.feather"
+            
+            fut = ex.submit(
+                clinvar_process_one, sample_id, candidates_path,
+                output_path, ClinVar, overwrite,
+            )
+            futures_map[fut] = (row.Index, sample_id, output_path)
+        
         ok = fail = 0
-        with tqdm(total=len(SampleID_Path), desc="Scanning ClinVar Submission") as pbar:
-            for fut in as_completed(futures):
+        with tqdm(total=len(futures_map), desc="Scanning ClinVar Submission") as pbar:
+            for fut in as_completed(futures_map):
+                row_idx, sample_id, out_path = futures_map[fut]
                 try:
-                    ret = fut.result()
-                    ok += int(ret == 1)
-                    fail += int(ret == 0)
-                except Exception:
+                    fut.result()
+                    output_paths[row_idx] = str(out_path)
+                    ok += 1
+                except Exception as e:
                     fail += 1
+                    print(f"\n[ERROR] ClinVar filter failed for {sample_id}: "
+                          f"{type(e).__name__}: {e}")
                 pbar.update(1)
                 pbar.set_postfix(Processed=ok, Fail=fail)
-
-    print(f'--Detected Variant With ClinVar Submission--\n')
-
-    #2. Merge Variants:
-    SampleInputs = {p.name.split(".feather")[0]:p for p in Path(ClinVarFiltered_path).iterdir()}
-    print(f"Loading Variants ...")
-    merged_data = []
-    for _, sample_path in SampleInputs.items():
-        merged_data.append(pd.read_feather(sample_path))
-    merged_data = pd.concat(merged_data, ignore_index=True, copy=False)
-    merged_data = merged_data.drop_duplicates(subset = ['varId'], keep = 'first').reset_index(drop = True)
-    input_tuples = list(merged_data[["varId", "VariationID", "HGVSc_core"]].itertuples(index=False, name=None))
-
-    #3. Call ClinVar API:
-    print(f"Calling ClinVar API ...")
-    futures = []
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        for (varId, vid, _) in input_tuples:
-            futures.append(ex.submit(database_process_one, varId, vid, ClinVarVariants_path, params, url, max_try, truncate))
+    
+    if fail > 0:
+        raise RuntimeError(f"ClinVar filter failed for {fail} sample(s).")
+    
+    # ===== Step 2: Merge variants across samples =====
+    print("2. Merging ClinVar-relevant variants across samples ...")
+    merged = pd.concat(
+        [pd.read_feather(p) for p in output_paths.values()],
+        ignore_index=True, copy=False,
+    )
+    merged = merged.drop_duplicates(subset=['varId'], keep='first').reset_index(drop=True)
+    input_tuples = list(merged[["varId", "VariationID", "HGVSc_core"]].itertuples(index=False, name=None))
+    print(f"  Unique ClinVar-annotated variants: {len(input_tuples)}")
+    
+    # ===== Step 3: Fetch ClinVar submissions from NCBI =====
+    print("3. Fetching ClinVar submission XML from NCBI ...")
+    with ThreadPoolExecutor(max_workers=NCBI_WORKERS) as ex:
+        futures = [
+            ex.submit(database_process_one,
+                      varId, vid, clinvar_submissions_dir,
+                      params, url, MAX_TRY, TRUNCATE, overwrite)
+            for (varId, vid, _) in input_tuples
+        ]
         ok = fail = 0
-        with tqdm(total=len(input_tuples), desc="Calling ClinVar - NCBI") as pbar:
+        with tqdm(total=len(futures), desc="Calling ClinVar - NCBI") as pbar:
             for fut in as_completed(futures):
                 try:
                     ret = fut.result()
@@ -249,25 +331,50 @@ def RunAgent(work_path, ClinVar_path, NCBI_EMAIL, NCBI_KEY, MODEL_NAME, OLLAMA_U
                 except Exception:
                     fail += 1
                 pbar.update(1)
-                pbar.set_postfix(Retreived=ok, Failed=fail)
-    print(f'--ClinVar Documents Preprocessing DONE--\n')
-    print(f"{sum(f.result() for f in as_completed(futures))}/{len(merged_data)} ClinVar Submissions are downloaded ...")
-
-    #4. Using LLM:
-    print(f"Database Agent (Model Name:{MODEL_NAME}) is working on ClinVar Data Records ...")
-    futures = []
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        for (varId, _, HGVSc_core) in input_tuples:
-            futures.append(ex.submit(call_ollama_one, MODEL_NAME, OLLAMA_URL, TEMPERATURE, LLM_res_path, ClinVarVariants_path, varId, HGVSc_core))
+                pbar.set_postfix(Retrieved=ok, Failed=fail)
+    
+    print(f"  {ok}/{len(input_tuples)} ClinVar submissions downloaded.")
+    
+    # ===== Step 4: Evaluate with LLM =====
+    print(f"4. Evaluating evidence with LLM (model={llm_config['model_name']}) ...")
+    with ThreadPoolExecutor(max_workers=LLM_WORKERS) as ex:
+        futures = [
+            ex.submit(call_ollama_one,
+                      llm_config["model_name"],
+                      llm_config["ollama_url"],
+                      llm_config["temperature"],
+                      llm_res_dir, clinvar_submissions_dir,
+                      varId, HGVSc_core, overwrite)
+            for (varId, _, HGVSc_core) in input_tuples
+        ]
         ok = fail = 0
-        with tqdm(total=len(input_tuples), desc="Evaluating Evidence") as pbar:
+        with tqdm(total=len(futures), desc="Evaluating Evidence") as pbar:
             for fut in as_completed(futures):
                 try:
                     ret = fut.result()
                     ok += int(ret == 1)
                     fail += int(ret == 0)
-                except Exception:
+                except Exception as e:
                     fail += 1
+                    print(f"\n[ERROR] LLM eval: {type(e).__name__}: {e}")
                 pbar.update(1)
                 pbar.set_postfix(Evaluated=ok, Failed=fail)
-    print(f"--Database Agent's Work is DONE--\n")
+    
+    # ===== Update samplesheet =====
+    samplesheet = samplesheet.copy()
+    samplesheet["clinvar_filtered_path"] = None
+    for row_idx, path in output_paths.items():
+        samplesheet.loc[row_idx, "clinvar_filtered_path"] = path
+    
+    # Database agent root path (for downstream: var-level outputs glob from this)
+    samplesheet["database_agent_root"] = str(output_root)
+    
+    # Save samplesheet (atomic)
+    samplesheet_path = work_dir / "samplesheet_with_paths.csv"
+    tmp = work_dir / ".samplesheet_with_paths.csv.tmp"
+    samplesheet.to_csv(tmp, index=False)
+    os.replace(tmp, samplesheet_path)
+    print(f"Updated samplesheet: {samplesheet_path}")
+    
+    print(f"--Database Agent DONE--\n")
+    return samplesheet

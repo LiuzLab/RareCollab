@@ -7,9 +7,10 @@ import pandas as pd
 import pyranges as pr
 import torch
 import torch.nn as nn
+import os
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
-from tqdm.auto import tqdm
+from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 #Default Key Parameters:
@@ -159,20 +160,31 @@ def collate_fn(df, label_col, domain_preprocs_states):
 
     return _collate
 
-def MoE(work_path, RANDOM_SEED = 42, RANK_ON_LOGIT = True):
+def MoE(samplesheet, work_dir, references=None, overwrite=False,
+        RANDOM_SEED=42, RANK_ON_LOGIT=True):
+    """
+    Run DNA diagnostic MoE model on each sample's vartogene.feather.
+    
+    Reads samplesheet["vartogene_feather_path"] column for input,
+    writes <sample>_MoE_scores.feather to Diagnostic_results/DNA_MoE/out/.
+    
+    Args:
+        samplesheet: DataFrame with sampleID + vartogene_feather_path columns.
+        work_dir: Base work directory.
+        references: Optional, for future use (model path could come from here).
+        overwrite: Re-run even if output exists.
+    """
+    work_dir = Path(work_dir)
     print(f'Creating work dir: ~/Diagnostic_results/DNA_MoE/')
-    input_path = work_path + '/AIM_Preprocess/VarToGene/out'
-    OUT_DIR = work_path + '/Diagnostic_results/DNA_MoE/out/'
-    Done_DIR = work_path + '/Diagnostic_results/DNA_MoE/done/'
-    Path(OUT_DIR).mkdir(parents=True, exist_ok=True)
-    Path(Done_DIR).mkdir(parents=True, exist_ok=True)
-    MODEL_PATH = "/home/guantongq/workspace/RNA_diagnosis/DNA_RNA_agent/clean_folder/MoE_Diagnostic_Engine/MoE_finalized.pt"
+    OUT_DIR = work_dir / "Diagnostic_results" / "DNA_MoE"
+    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    MODEL_PATH = references.rarecollab.moe_model
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    #Set Random seeds:
     set_seed(RANDOM_SEED)
 
-    #Prepare Model:
+    # Load MoE model
     print(f'Loading MoE Model ...')
     ckpt = torch.load(MODEL_PATH, map_location="cpu", weights_only=False)
     state_dict = ckpt["state_dict"]
@@ -180,61 +192,90 @@ def MoE(work_path, RANDOM_SEED = 42, RANK_ON_LOGIT = True):
     domain_input = {k: ckpt["domain_preprocs_state"][k]["out_dim"] for k in domain_names}
 
     print(f"Domains Experts: {domain_names}")
-    model = DomainMoE(domain_input = domain_input,
-                  fusion_hidden_dims = ckpt['fusion_hidden_dims'],
-                  expert_embed_dim= ckpt['expert_embed_dim'],
-                  use_layer_norm = ckpt['use_layer_norm'],
-                  expert_dropout = ckpt['expert_dropout'],
-                  fusion_dropout = ckpt['fusion_dropout'])
+    model = DomainMoE(
+        domain_input=domain_input,
+        fusion_hidden_dims=ckpt['fusion_hidden_dims'],
+        expert_embed_dim=ckpt['expert_embed_dim'],
+        use_layer_norm=ckpt['use_layer_norm'],
+        expert_dropout=ckpt['expert_dropout'],
+        fusion_dropout=ckpt['fusion_dropout'],
+    )
     model = model.to(device)
-    #Load weights
+
     try:
         model.load_state_dict(state_dict, strict=True)
-        print(f"[Model] Loaded. expert_embed_dim={ckpt['expert_embed_dim']}, fusion_hidden_dims={ckpt['fusion_hidden_dims']}, use_layer_norm={ckpt['use_layer_norm']}")
+        print(f"[Model] Loaded. expert_embed_dim={ckpt['expert_embed_dim']}, "
+              f"fusion_hidden_dims={ckpt['fusion_hidden_dims']}, "
+              f"use_layer_norm={ckpt['use_layer_norm']}")
     except Exception as e:
         print("[ERROR] load_state_dict(strict=True) failed.")
         print(f"  - domain_names={domain_names}")
-        print(f"  - expert_embed_dim={ckpt['expert_embed_dim']}, fusion_hidden_dims={ckpt['fusion_hidden_dims']}, use_layer_norm={ckpt['use_layer_norm']}")
-        print(f"  - expert_dropout={ckpt['expert_dropout']}, fusion_dropout={ckpt['fusion_dropout']}")
+        print(f"  - expert_embed_dim={ckpt['expert_embed_dim']}, "
+              f"fusion_hidden_dims={ckpt['fusion_hidden_dims']}, "
+              f"use_layer_norm={ckpt['use_layer_norm']}")
+        print(f"  - expert_dropout={ckpt['expert_dropout']}, "
+              f"fusion_dropout={ckpt['fusion_dropout']}")
         raise e
     model.eval()
 
-    SampleIDs_Path = {p.name.split('.')[0]:p for p in Path(input_path).iterdir()}
+    # Build SamplePath from samplesheet (not from glob)
+    if "vartogene_feather_path" not in samplesheet.columns:
+        raise ValueError(
+            "samplesheet missing 'vartogene_feather_path' column. "
+            "Run GENERATE_SINGLETON_FEATURES first."
+        )
+    SampleIDs_Path = {
+        row.sampleID: Path(row.vartogene_feather_path)
+        for row in samplesheet.itertuples(index=False)
+    }
     
-    #Evaulating Samples ...
-    for sample_id, sample_path in tqdm(SampleIDs_Path.items(), desc="MoE on Samples", total=len(SampleIDs_Path)):
-        print(f"", flush = True)
-        done = Path(Done_DIR + f"{sample_id}.done")
-        if done.exists():
+    output_paths = {}
+
+    # Evaluate samples
+    for sample_id, sample_path in tqdm(SampleIDs_Path.items(),
+                                        desc="MoE on Samples",
+                                        total=len(SampleIDs_Path)):
+        output_path = OUT_DIR / f"{sample_id}_MoE_scores.feather"
+        
+        # Cache hit: skip if output exists and not overwrite
+        if output_path.exists() and not overwrite:
+            output_paths[sample_id] = str(output_path)
             continue
+        
+        if not sample_path.exists():
+            print(f"[WARN] vartogene feather not found for {sample_id}: {sample_path}")
+            continue
+        
         processed_data = pd.read_feather(sample_path)
         N = len(processed_data)
 
-        #Put/Split data in loader:
-        loader = DataLoader(list(range(N)),
-                    batch_size=BATCH_SIZE,
-                    shuffle=False,
-                    num_workers=1,
-                    collate_fn=collate_fn(processed_data, LABEL_COL, ckpt["domain_preprocs_state"]),
-                    pin_memory=(device == "cuda"),
-                    persistent_workers=True)
-        
-        #Preallocate outputs
+        loader = DataLoader(
+            list(range(N)),
+            batch_size=BATCH_SIZE,
+            shuffle=False,
+            num_workers=1,
+            collate_fn=collate_fn(processed_data, LABEL_COL, ckpt["domain_preprocs_state"]),
+            pin_memory=(device == "cuda"),
+            persistent_workers=True,
+        )
+
+        # Preallocate outputs
         overall_logit = np.empty(N, dtype=np.float32)
         overall_prob = np.empty(N, dtype=np.float32)
         domain_scores = {name: np.empty(N, dtype=np.float32) for name in domain_names}
 
-        # ---- Forward ----
+        # Forward
         with torch.no_grad():
             for batch in loader:
                 idx = batch["idx"].numpy()
-                inputs = {name: batch[f"{name}"].to(device, non_blocking=True) for name in domain_names}
+                inputs = {name: batch[f"{name}"].to(device, non_blocking=True)
+                          for name in domain_names}
 
-                with torch.amp.autocast(device_type = device, enabled=(device == "cuda")):
+                with torch.amp.autocast(device_type=device, enabled=(device == "cuda")):
                     out = model(inputs)
                     logit_t = out["overall_logit"]
                     prob_t = torch.sigmoid(logit_t)
-                    dom_t = out["domain_logits"]  # [B, K]
+                    dom_t = out["domain_logits"]
 
                 overall_logit[idx] = logit_t.detach().cpu().numpy().astype(np.float32, copy=False)
                 overall_prob[idx] = prob_t.detach().cpu().numpy().astype(np.float32, copy=False)
@@ -242,83 +283,93 @@ def MoE(work_path, RANDOM_SEED = 42, RANK_ON_LOGIT = True):
                 dom_np = dom_t.detach().cpu().numpy().astype(np.float32, copy=False)
                 for j, name in enumerate(domain_names):
                     domain_scores[name][idx] = dom_np[:, j]
-        
-        # Organize output:
-        output = processed_data[['varId','identifier','geneSymbol','dominant','recessive','zyg','HGVSc','cons_frameshift_variant',
-                                 'transcript_id','HGVSc_core','HGVSp','transcript_score','gnomadGenePLI',
-                                 'gnomadGeneOELof','gnomadGeneOELofUpper','is_causal']].copy()
+
+        # Organize output
+        output = processed_data[[
+            'varId', 'identifier', 'geneSymbol', 'dominant', 'recessive', 'zyg',
+            'HGVSc', 'cons_frameshift_variant', 'transcript_id', 'HGVSc_core',
+            'HGVSp', 'transcript_score', 'gnomadGenePLI', 'gnomadGeneOELof',
+            'gnomadGeneOELofUpper', 'is_causal',
+        ]].copy()
         output["overall_logit"] = overall_logit
         output["overall_prob"] = overall_prob
         for name in domain_names:
             output[f"score_{name}"] = domain_scores[name]
-            output[f"rank_{name}"] = output["varId"].map(output.groupby("varId", dropna=False)[f"score_{name}"].max().rank(method='max',ascending=False).astype(int))
+            output[f"rank_{name}"] = output["varId"].map(
+                output.groupby("varId", dropna=False)[f"score_{name}"]
+                .max().rank(method='max', ascending=False).astype(int)
+            )
         if RANK_ON_LOGIT:
-            output['Diagnostic_Engine_Rank'] = output["varId"].map(output.groupby("varId", dropna=False)["overall_logit"].max().rank(method='max',ascending=False).astype(int))
+            output['Diagnostic_Engine_Rank'] = output["varId"].map(
+                output.groupby("varId", dropna=False)["overall_logit"]
+                .max().rank(method='max', ascending=False).astype(int)
+            )
         else:
-            output['Diagnostic_Engine_Rank'] = output["varId"].map(output.groupby("varId", dropna=False)["overall_prob"].max().rank(method='max',ascending=False).astype(int))
-        
-        
+            output['Diagnostic_Engine_Rank'] = output["varId"].map(
+                output.groupby("varId", dropna=False)["overall_prob"]
+                .max().rank(method='max', ascending=False).astype(int)
+            )
 
-        #Save output
-        output.to_feather(OUT_DIR + sample_id + "_MoE_scores.feather")
-        done.write_text("done\n", encoding="utf-8")
-    
+        # Atomic write
+        tmp = OUT_DIR / f".{sample_id}_MoE_scores.feather.tmp"
+        output.to_feather(tmp)
+        os.replace(tmp, output_path)
+        output_paths[sample_id] = str(output_path)
+
     print(f"--DNA Diagnostic Engine DONE--\n")
+    # Update samplesheet with output paths
+    samplesheet = samplesheet.copy()
+    samplesheet["moe_score_path"] = samplesheet["sampleID"].map(output_paths)
+    
+    # Save updated samplesheet (atomic write)
+    samplesheet_path = Path(work_dir) / "samplesheet_with_paths.csv"
+    tmp = Path(work_dir) / ".samplesheet_with_paths.csv.tmp"
+    samplesheet.to_csv(tmp, index=False)
+    os.replace(tmp, samplesheet_path)
+    print(f"Updated samplesheet: {samplesheet_path}")
+    
+    return samplesheet
 
 def _join_rule_labels(row_bool: pd.Series) -> str:
     names = [name for name, hit in row_bool.items() if bool(hit)]
     return ", ".join(names)
 
 
-def filter_one(sample_id, sample_path, RNA_path, outpath):
-    save_file = Path(f"{outpath}/{sample_id}_nomcand.feather")
-    if save_file.exists():
-        return 1
-    #Load data:
-    data = pd.read_feather(sample_path)
+def filter_one(sample_id,  moe_path, expression_path, splicing_path, ase_path,
+               output_path, overwrite=False):
+    if output_path.exists() and not overwrite:
+        return {
+            "has_expression": 'Skip',
+            "has_splicing": 'Skip',
+            "has_ase": 'Skip',
+        }
+    # Load DNA MoE scores
+    data = pd.read_feather(moe_path)
 
-    #Load RNA related Files and Merge with DNA results:
-    expression_path = RNA_path + "/Expression/" + sample_id + ".feather"
-    splicing_path = RNA_path + "/Splicing/" + sample_id + ".feather"
-    ASE_path = RNA_path + "/ASE/" + sample_id + ".feather"
-
-    #Expression:
-    if Path(expression_path).exists():
+    # Expression
+    if expression_path is not None and expression_path.exists():
         expression_data = pd.read_feather(expression_path)
-        expression_data = expression_data.rename(columns = {'GeneSymbol':'geneSymbol', 'pValue':'Outrider_pValue', 'padjust':'Outrider_padjust', 
-                                                            'zScore':'Outrider_zScore', 'l2fc':'Outrider_l2f', 'rawcounts': 'Outrider_rawcounts'})
+        expression_data = expression_data.rename(columns={
+            'GeneSymbol': 'geneSymbol', 'pValue': 'Outrider_pValue',
+            'padjust': 'Outrider_padjust', 'zScore': 'Outrider_zScore',
+            'l2fc': 'Outrider_l2f', 'rawcounts': 'Outrider_rawcounts',
+        })
         if 'RawZscore' in expression_data.columns:
-            expression_data = expression_data.rename(columns = {'RawZscore': 'Outrider_RawZscore'})
+            expression_data = expression_data.rename(columns={'RawZscore': 'Outrider_RawZscore'})
         else:
             expression_data['Outrider_RawZscore'] = np.nan
         has_RNA_expression = True
     else:
-        expression_data = pd.DataFrame({'geneSymbol':['None'], 'Outrider_pValue':np.nan, 'Outrider_padjust':np.nan,
-                                'Outrider_zScore':np.nan, 'Outrider_l2f':np.nan, 'Outrider_rawcounts':np.nan,
-                                'Outrider_RawZscore': np.nan})
+        expression_data = pd.DataFrame({
+            'geneSymbol': ['None'], 'Outrider_pValue': np.nan,
+            'Outrider_padjust': np.nan, 'Outrider_zScore': np.nan,
+            'Outrider_l2f': np.nan, 'Outrider_rawcounts': np.nan,
+            'Outrider_RawZscore': np.nan,
+        })
         has_RNA_expression = False
-    data = data.merge(expression_data, on = 'geneSymbol', how = 'left')
+    data = data.merge(expression_data, on='geneSymbol', how='left')
 
-    #Splicing:
-    if Path(splicing_path).exists():
-        splicing_data = pd.read_feather(splicing_path)
-        splicing_data = splicing_data.drop(columns = ['sampleID'])
-        splicing_data = splicing_data.rename(columns = {'pvaluesBetaBinomial_jaccard':'Fraser_pvaluesBetaBinomial_jaccard','psi5':'Fraser_psi5', 'psi3':'Fraser_psi3',
-                                                        'rawOtherCounts_psi5':'Fraser_rawOtherCounts_psi5', 'rawOtherCounts_psi3':'Fraser_rawOtherCounts_psi3',
-                                                        'rawCountsJnonsplit':'Fraser_rawCountsJnonsplit', 'jaccard':'Fraser_jaccard',
-                                                        'rawOtherCounts_jaccard':'Fraser_rawOtherCounts_jaccard', 'delta_jaccard':'Fraser_delta_jaccard',
-                                                        'delta_psi5':'Fraser_delta_psi5', 'delta_psi3':'Fraser_delta_psi3',
-                                                        'predictedMeans_jaccard':'Fraser_predictedMeans_jaccard'})
-        has_RNA_splicing = True
-    else:
-        splicing_data = pd.DataFrame({'seqnames':['None'], 'start':np.nan, 'end':np.nan, 'strand':np.nan, 'hgnc_symbol':np.nan,
-                                    'Fraser_pvaluesBetaBinomial_jaccard': np.nan, 'Fraser_psi5': np.nan, 'Fraser_psi3': np.nan,
-                                    'Fraser_rawOtherCounts_psi5': np.nan, 'Fraser_rawOtherCounts_psi3': np.nan, 'Fraser_rawCountsJnonsplit':np.nan,
-                                    'Fraser_jaccard':np.nan, 'Fraser_rawOtherCounts_jaccard':np.nan, 'Fraser_delta_jaccard':np.nan,
-                                    'Fraser_delta_psi5':np.nan, 'Fraser_delta_psi3':np.nan, 'Fraser_predictedMeans_jaccard':np.nan})
-        has_RNA_splicing = False
-
-    #data processing
+    # Variant ID parsing (always done — downstream code may use these columns)
     parts = data["varId"].astype(str).str.strip().str.split("_", n=3, expand=True)
     chr_raw = parts[0]
     pos = pd.to_numeric(parts[1], errors="coerce")
@@ -330,40 +381,90 @@ def filter_one(sample_id, sample_path, RNA_path, outpath):
     data["Start"] = data["Pos"].astype(int)
     data["End"] = data["Start"] + 1
 
-    #splicing processing:
-    splicing_data = splicing_data.copy()
-    splicing_data = splicing_data.dropna(subset=['hgnc_symbol'])
-    splicing_data['geneSymbol'] = splicing_data['hgnc_symbol'].astype(str).str.split(';')
-    splicing_data = splicing_data.explode('geneSymbol', ignore_index=True)
-    #gene-level processing:
-    splicing_min_gene_level = splicing_data.loc[splicing_data.groupby("geneSymbol")["Fraser_pvaluesBetaBinomial_jaccard"].idxmin()].reset_index(drop=True)
-    splicing_min_gene_level = splicing_min_gene_level[['geneSymbol','Fraser_pvaluesBetaBinomial_jaccard']]
-    splicing_min_gene_level = splicing_min_gene_level.rename(columns = {'Fraser_pvaluesBetaBinomial_jaccard':'Fraser_GenePvalue'})
-    #variant-level processing:
-    splicing_data = splicing_data.copy()
-    splicing_data = splicing_data.rename(columns = {'seqnames':'Chromosome', 'start':'Start', 'end':'End'})
-    splicing_data["End"] = splicing_data["End"] + 1
-    gr_pt = pr.PyRanges(data[["Chromosome", "Start", "End", "varId"]])
-    gr_iv = pr.PyRanges(splicing_data.drop(columns=["seqnames", "start", "end"], errors="ignore"))
+    # Splicing
+    if splicing_path is not None and splicing_path.exists():
+        splicing_data = pd.read_feather(splicing_path)
+        splicing_data = splicing_data.drop(columns=['sampleID'])
+        splicing_data = splicing_data.rename(columns={
+            'pvaluesBetaBinomial_jaccard': 'Fraser_pvaluesBetaBinomial_jaccard',
+            'psi5': 'Fraser_psi5', 'psi3': 'Fraser_psi3',
+            'rawOtherCounts_psi5': 'Fraser_rawOtherCounts_psi5',
+            'rawOtherCounts_psi3': 'Fraser_rawOtherCounts_psi3',
+            'rawCountsJnonsplit': 'Fraser_rawCountsJnonsplit',
+            'jaccard': 'Fraser_jaccard',
+            'rawOtherCounts_jaccard': 'Fraser_rawOtherCounts_jaccard',
+            'delta_jaccard': 'Fraser_delta_jaccard',
+            'delta_psi5': 'Fraser_delta_psi5', 'delta_psi3': 'Fraser_delta_psi3',
+            'predictedMeans_jaccard': 'Fraser_predictedMeans_jaccard',
+        })
+        has_RNA_splicing = True
 
-    hit = gr_pt.join(gr_iv).df
-    hit_min = hit.loc[hit.groupby("varId")["Fraser_pvaluesBetaBinomial_jaccard"].idxmin()].reset_index(drop=True)
-    hit_min = hit_min.rename(columns = {'Start_b': 'Fraser_junction_start', 'End_b': 'Fraser_junction_end'})
-    hit_min = hit_min.drop(columns = ['Chromosome', 'Start', 'End', 'strand', 'hgnc_symbol', 'geneSymbol'])
+        # Splicing processing
+        splicing_data = splicing_data.dropna(subset=['hgnc_symbol'])
+        splicing_data['geneSymbol'] = splicing_data['hgnc_symbol'].astype(str).str.split(';')
+        splicing_data = splicing_data.explode('geneSymbol', ignore_index=True)
 
-    data = data.merge(splicing_min_gene_level, on = 'geneSymbol', how = 'left')
-    data = data.merge(hit_min, on = 'varId', how = 'left')
+        # Gene-level
+        splicing_min_gene_level = splicing_data.loc[
+            splicing_data.groupby("geneSymbol")["Fraser_pvaluesBetaBinomial_jaccard"].idxmin()
+        ].reset_index(drop=True)
+        splicing_min_gene_level = splicing_min_gene_level[['geneSymbol', 'Fraser_pvaluesBetaBinomial_jaccard']]
+        splicing_min_gene_level = splicing_min_gene_level.rename(
+            columns={'Fraser_pvaluesBetaBinomial_jaccard': 'Fraser_GenePvalue'}
+        )
 
-    #ASE:
-    if Path(ASE_path).exists():
-        ASE_data = pd.read_feather(ASE_path)
-        ASE_data = ASE_data[['varId','REF','ALT','REF_COUNT','ALT_COUNT','ALT_RATIO','PVAL','IS_MAE']]
-        ASE_data = ASE_data.rename(columns = {'REF':'ASE_REF','ALT':'ASE_ALT','REF_COUNT':'ASE_REF_COUNT',
-                                            'ALT_COUNT': 'ASE_ALT_COUNT', 'ALT_RATIO':'ASE_ALT_RATIO', 'PVAL': 'ASE_PVAL'})
+        # Variant-level via pyranges interval join
+        splicing_data_pr = splicing_data.copy()
+        splicing_data_pr = splicing_data_pr.rename(
+            columns={'seqnames': 'Chromosome', 'start': 'Start', 'end': 'End'}
+        )
+        splicing_data_pr["End"] = splicing_data_pr["End"] + 1
+        gr_pt = pr.PyRanges(data[["Chromosome", "Start", "End", "varId"]])
+        gr_iv = pr.PyRanges(splicing_data_pr.drop(columns=["seqnames", "start", "end"], errors="ignore"))
+
+        hit = gr_pt.join(gr_iv).df
+        hit_min = hit.loc[
+            hit.groupby("varId")["Fraser_pvaluesBetaBinomial_jaccard"].idxmin()
+        ].reset_index(drop=True)
+        hit_min = hit_min.rename(columns={'Start_b': 'Fraser_junction_start', 'End_b': 'Fraser_junction_end'})
+        hit_min = hit_min.drop(columns=['Chromosome', 'Start', 'End', 'strand', 'hgnc_symbol', 'geneSymbol'])
+
+        data = data.merge(splicing_min_gene_level, on='geneSymbol', how='left')
+        data = data.merge(hit_min, on='varId', how='left')
+    else:
+        # No splicing data — fill all 15 Fraser_* columns with NaN to keep
+        # downstream schema consistent with the has-splicing case.
+        has_RNA_splicing = False
+        for col in [
+            'Fraser_GenePvalue',
+            'Fraser_pvaluesBetaBinomial_jaccard',
+            'Fraser_psi5', 'Fraser_psi3',
+            'Fraser_rawOtherCounts_psi5', 'Fraser_rawOtherCounts_psi3',
+            'Fraser_rawCountsJnonsplit',
+            'Fraser_jaccard', 'Fraser_rawOtherCounts_jaccard',
+            'Fraser_delta_jaccard',
+            'Fraser_delta_psi5', 'Fraser_delta_psi3',
+            'Fraser_predictedMeans_jaccard',
+            'Fraser_junction_start', 'Fraser_junction_end',
+        ]:
+            data[col] = np.nan
+
+    # ASE
+    if ase_path is not None and ase_path.exists():
+        ASE_data = pd.read_feather(ase_path)
+        ASE_data = ASE_data[['varId', 'REF', 'ALT', 'REF_COUNT', 'ALT_COUNT', 'ALT_RATIO', 'PVAL', 'IS_MAE']]
+        ASE_data = ASE_data.rename(columns={
+            'REF': 'ASE_REF', 'ALT': 'ASE_ALT',
+            'REF_COUNT': 'ASE_REF_COUNT', 'ALT_COUNT': 'ASE_ALT_COUNT',
+            'ALT_RATIO': 'ASE_ALT_RATIO', 'PVAL': 'ASE_PVAL',
+        })
         has_RNA_ASE = True
     else:
-        ASE_data = pd.DataFrame({'varId':['None'], 'ASE_REF': None, 'ASE_ALT':None, 'ASE_REF_COUNT':np.nan,
-                                'ASE_ALT_COUNT':np.nan, 'ASE_ALT_RATIO':np.nan, 'ASE_PVAL':np.nan, 'IS_MAE': 0})
+        ASE_data = pd.DataFrame({
+            'varId': ['None'], 'ASE_REF': None, 'ASE_ALT': None,
+            'ASE_REF_COUNT': np.nan, 'ASE_ALT_COUNT': np.nan,
+            'ASE_ALT_RATIO': np.nan, 'ASE_PVAL': np.nan, 'IS_MAE': 0,
+        })
         has_RNA_ASE = False
     data = data.merge(ASE_data, on='varId', how='left')
     
@@ -408,38 +509,103 @@ def filter_one(sample_id, sample_path, RNA_path, outpath):
     candidate_data = candidate_data[final_mask]
     candidate_data = candidate_data[candidate_data["geneSymbol"]!="-"].copy()
 
-    candidate_data.to_feather(save_file)
-    print(f"Sample:{sample_id}, hasDNA: True; hasExpression: {has_RNA_expression}; hasSplicing:{has_RNA_splicing}; hasASE:{has_RNA_ASE}")
-    return 1
+    tmp = output_path.parent / f".{output_path.name}.tmp"
+    candidate_data.to_feather(tmp)
+    os.replace(tmp, output_path)
+    return {
+        "has_expression": has_RNA_expression,
+        "has_splicing": has_RNA_splicing,
+        "has_ase": has_RNA_ASE,
+    }
 
-def Candidates(work_path, max_workers = 5):
-    DNA_path = work_path + '/Diagnostic_results/DNA_MoE/out'
-    RNA_path = work_path + '/Diagnostic_results/RNA_MoE/'
-    if not Path(DNA_path).exists():
-        raise ValueError(f"Prerequsite Results NOT Found - Please Run MoE First ...")
-
-    SamplePath = {p.name.split("_MoE_scores.feather")[0]:p for p in Path(DNA_path).iterdir()}
-    outpath = work_path + '/Diagnostic_results/Candidates/'
+def Candidates(samplesheet, work_dir, config=None, overwrite=False):
+    default_config = {"candidates_workers": 1}
+    cfg = {**default_config, **(config or {})}
     
-    #Input/Output Path:
-    print(f'Creating work dir: ~/Diagnostic_results/Candidates/')
-    Path(outpath).mkdir(parents=True, exist_ok=True)
+    work_dir = Path(work_dir)
     
-    #Filter Candidates:
-    print(f"Scanning Candidate ...")
-    futures = []
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        for sample_id, sample_path in SamplePath.items():
-            futures.append(ex.submit(filter_one, sample_id, sample_path, RNA_path, outpath))
-        ok = fail = 0
-        with tqdm(total=len(SamplePath), desc="Detecting Candidates") as pbar:
-            for fut in as_completed(futures):
+    if "moe_score_path" not in samplesheet.columns:
+        raise ValueError(
+            "samplesheet missing 'moe_score_path' column. "
+            "Run DiagnosticEngine.MoE first."
+        )
+    
+    outpath = work_dir / "Diagnostic_results" / "Candidates"
+    outpath.mkdir(parents=True, exist_ok=True)
+    
+    print(f"Scanning Candidates ...")
+    
+    output_paths = {}
+    futures_map = {}
+    ok = fail = 0
+    
+    with ThreadPoolExecutor(max_workers=cfg["candidates_workers"]) as ex:
+        for row in samplesheet.itertuples(index=True):
+            sample_id = row.sampleID
+            moe_path = Path(row.moe_score_path)
+            output_path = outpath / f"{sample_id}_nomcand.feather"
+            
+            # RNA paths optional — pass None if column missing or value NaN
+            expr_path = _get_optional_path(row, "rna_expression_path")
+            splicing_path = _get_optional_path(row, "rna_splicing_path")
+            ase_path = _get_optional_path(row, "rna_ase_path")
+            
+            fut = ex.submit(
+                filter_one, sample_id, moe_path,
+                expr_path, splicing_path, ase_path,
+                output_path, overwrite,
+            )
+            futures_map[fut] = (row.Index, sample_id, output_path)
+        sample_info = {}
+        
+        with tqdm(total=len(futures_map), desc="Detecting Candidates") as pbar:
+            for fut in as_completed(futures_map):
+                row_idx, sample_id, out_path = futures_map[fut]
                 try:
-                    ret = fut.result()
-                    ok += int(ret == 1)
-                    fail += int(ret == 0)
-                except Exception:
+                    info = fut.result()
+                    output_paths[row_idx] = str(out_path)
+                    sample_info[sample_id] = info
+                    ok += 1
+                except Exception as e:
                     fail += 1
+                    print(f"\n[ERROR] Candidates failed for {sample_id}: "
+                          f"{type(e).__name__}: {e}")
                 pbar.update(1)
                 pbar.set_postfix(ok=ok, fail=fail)
-    print(f'--Candidate Filtering DONE--\n')
+    
+    if fail > 0:
+        raise RuntimeError(f"Candidates failed for {fail} sample(s).")
+    print()
+    for sample_id, info in sample_info.items():
+        print(f"  {sample_id}: hasDNA=True, "
+              f"hasExpression={info['has_expression']}, "
+              f"hasSplicing={info['has_splicing']}, "
+              f"hasASE={info['has_ase']}")
+
+    # Update samplesheet
+    samplesheet = samplesheet.copy()
+    samplesheet["candidates_path"] = None
+    for row_idx, path in output_paths.items():
+        samplesheet.loc[row_idx, "candidates_path"] = path
+    
+    # Atomic write samplesheet
+    samplesheet_path = work_dir / "samplesheet_with_paths.csv"
+    tmp = work_dir / ".samplesheet_with_paths.csv.tmp"
+    samplesheet.to_csv(tmp, index=False)
+    os.replace(tmp, samplesheet_path)
+    print(f"Updated samplesheet: {samplesheet_path}")
+    
+    print(f"--Candidate Filtering DONE--\n")
+    return samplesheet
+
+
+def _get_optional_path(row, col_name):
+    """Helper: safely get an optional path column from a samplesheet row."""
+    if not hasattr(row, col_name):
+        return None
+    val = getattr(row, col_name)
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return None
+    if isinstance(val, str) and val.strip() == "":
+        return None
+    return Path(val)

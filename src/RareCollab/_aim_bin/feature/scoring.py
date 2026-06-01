@@ -1,0 +1,85 @@
+from typing import List
+
+import pandas as pd
+
+from annotation.symptom_matching import clinVarSymMatch, hgmdSymMatch, omimSymMatch
+from annotation.curation_scoring import getCurationScore
+from annotation.conservation_scoring import getConservationScore
+from annotation.marrvel_score_recalc import (
+    load_raw_matrix,
+    omimCurate,
+    hgmdCurate,
+    clinvarCurate,
+    conservationCurate,
+)
+
+
+def apply_curate_scores(
+    annotate_info_df: pd.DataFrame,
+    omim_hpo_score_df: pd.DataFrame,
+    hgmd_hpo_score_acc_df: pd.DataFrame,
+    hgmd_hpo_score_gene_df: pd.DataFrame,
+    in_file_type: str,
+) -> pd.DataFrame:
+    """
+    OPTIMIZATION: pre-index the per-row lookup tables by their join key
+    so the callbacks can do O(1) lookups instead of O(N) boolean filters
+    on every variant row.
+    """
+    #print("=== USING OPTIMIZED apply_curate_scores (NEW VERSION) ===")
+    
+    # Pre-index for O(1) lookup. drop=False keeps the Pheno_ID column too.
+    if not omim_hpo_score_df.index.name == "Pheno_ID":
+        omim_hpo_score_df = omim_hpo_score_df.set_index("Pheno_ID", drop=False)
+
+    rows: List[dict] = []
+    for _, var_obj in annotate_info_df.iterrows():
+        omimSymMatch(var_obj, omim_hpo_score_df, in_file_type)
+        hgmdSymMatch(var_obj, hgmd_hpo_score_acc_df, hgmd_hpo_score_gene_df)
+        clinVarSymMatch(var_obj, in_file_type)
+        curation_scores = getCurationScore(var_obj)
+        rows.append(
+            {
+                "curationScoreOMIM": curation_scores[0],
+                "curationScoreHGMD": curation_scores[1],
+                "curationScoreClinVar": curation_scores[2],
+                "curationScoreTotal": curation_scores[3],
+                "symptomScore": var_obj.symptomScore,
+                "symptomName": var_obj.symptomName,
+                "omimSymMatchFlag": var_obj.omimSymMatchFlag,
+                "omimSymptomSimScore": var_obj.omimSymptomSimScore,
+                "hgmdSymptomScore": var_obj.hgmdSymptomScore,
+                "hgmdSymMatchFlag": var_obj.hgmdSymMatchFlag,
+                "hgmdSymptomSimScore": var_obj.hgmdSymptomSimScore,
+            }
+        )
+
+    result_df = pd.DataFrame(rows)
+    annotate_info_df[result_df.columns] = result_df
+    return annotate_info_df
+
+
+def apply_conservation_scores(annotate_info_df: pd.DataFrame, disease_inh: str) -> pd.DataFrame:
+    rows: List[dict] = []
+    for _, var_obj in annotate_info_df.iterrows():
+        ret_list = getConservationScore(var_obj, disease_inh)
+        rows.append(
+            {
+                "conservationScoreGnomad": ret_list[0],
+                "conservationScoreDGV": ret_list[1],
+                "conservationScoreOELof": ret_list[2],
+            }
+        )
+
+    result_df = pd.DataFrame(rows)
+    annotate_info_df[result_df.columns] = result_df
+    return annotate_info_df
+
+
+def recalculate_scores(annotate_info_df: pd.DataFrame) -> pd.DataFrame:
+    score = load_raw_matrix(annotate_info_df)
+    score = omimCurate(score)
+    score = hgmdCurate(score)
+    score = clinvarCurate(score)
+    score = conservationCurate(score)
+    return score
