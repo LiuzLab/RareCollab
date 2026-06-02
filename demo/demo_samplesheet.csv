@@ -1,0 +1,4 @@
+sampleID,vcf_path,hpo_path
+sample_1,/path/.../sample_1.vcf.gz,/path/.../sample_1.hpo.txt
+sample_2,/path/.../sample_2.vcf.gz,/path/.../sample_2.hpo.txt
+sample_3,/path/.../sample_3.vcf.gz,/path/.../sample_3.hpo.txt

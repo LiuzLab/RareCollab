@@ -35,7 +35,7 @@ def RecommendWorkerConfig(samplesheet):
 
     split_workers = min(n_samples, n_cpus, 12)
     vep_fork = 12
-    vep_workers = max(1, min(n_samples, n_cpus // vep_fork))
+    vep_workers = max(1, min(n_samples, 2*n_cpus // vep_fork))
     hpo_workers = min(n_samples, n_cpus, 12)
     modules_workers = min(n_cpus, 24)
 
@@ -610,7 +610,7 @@ module load singularity
 singularity exec --nv \\
 --env OLLAMA_HOST=0.0.0.0:{port} \\
 --env OLLAMA_NUM_PARALLEL={num_parallel} \\
-docker://ollama/ollama \\
+docker://ollama/ollama:0.18.0 \\
 bash -c "ollama serve & sleep 10 && ollama pull {model_name} && wait"
 """
     
