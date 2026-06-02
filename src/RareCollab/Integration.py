@@ -647,10 +647,31 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
     Insilico_res = load_LLM_res(sub_insilico_path, model_type='Insilico', candidate_type='varId')
 
     # RNA — preserve original behavior; load if available, else empty placeholder
-    RNA_gene_res = load_RNALLM_res(sub_rna_genelevel_path, model_type='RNA_GeneLevel', candidate_type='geneSymbol')
-    RNA_var_res = load_RNALLM_res(sub_rna_varlevel_path, model_type='RNA_VarLevel', candidate_type='geneSymbol_VarId')
-    RNA_var_res[['geneSymbol', 'varId']] = RNA_var_res['geneSymbol_VarId'].str.split('_VarId_', n=1, expand=True)
+    # RNA — preserve original behavior; load if available, else empty placeholder
+    if sub_rna_genelevel_path.exists():
+        RNA_gene_res = load_RNALLM_res(
+            sub_rna_genelevel_path, model_type='RNA_GeneLevel', candidate_type='geneSymbol',
+        )
+    else:
+        RNA_gene_res = pd.DataFrame(columns=[
+            'geneSymbol', 'RNA_GeneLevel_Reasoning',
+            'RNA_GeneLevel_Event', 'RNA_GeneLevel_Conclusion',
+        ])
 
+    if sub_rna_varlevel_path.exists():
+        RNA_var_res = load_RNALLM_res(
+            sub_rna_varlevel_path, model_type='RNA_VarLevel', candidate_type='geneSymbol_VarId',
+        )
+        RNA_var_res[['geneSymbol', 'varId']] = RNA_var_res['geneSymbol_VarId'].str.split(
+            '_VarId_', n=1, expand=True,
+        )
+    else:
+        RNA_var_res = pd.DataFrame(columns=[
+            'geneSymbol_VarId', 'RNA_VarLevel_Reasoning',
+            'RNA_VarLevel_Event', 'RNA_VarLevel_Conclusion',
+            'geneSymbol', 'varId',
+        ])
+    
     AQ_path = work_dir / "Agents" / "RNA" / "AlleleQuantification" / f"{sample_id}.feather"
     if AQ_path.exists():
         AlleleQuant = pd.read_feather(AQ_path).reset_index(drop=True)
