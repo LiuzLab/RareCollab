@@ -323,3 +323,161 @@ samplesheet = RareCollab.Integration.Review(
 ```
 
 After this step completes, your final integrated results are available at `output_path`.
+
+### Output Format
+
+The integrated results are written as **CSV files, one per sample** (split by `identifier` / sampleID). Within each CSV, candidate variants are **already ranked**
+
+The columns in each output CSV are described below.
+
+#### Variant & Gene Identity
+
+| Column | Description |
+|---|---|
+| `varId` | Variant ID, formatted as chromosome + `_` + position. |
+| `identifier` | Sample ID. |
+| `geneSymbol` | Gene symbol. |
+| `HGVSc` | Coding-level (cDNA) variant nomenclature in HGVS format. |
+| `HGVSc_core` | Final retained cDNA HGVS string. |
+| `HGVSp` | Protein-level variant nomenclature in HGVS format. |
+| `transcript_id` | Ensembl transcript ID. |
+| `geneSymbol_VarId` | Combined gene-symbol + variant-ID key. |
+| `Chromosome` | Chromosome. |
+| `Pos` | Variant position. |
+| `Start` | Start coordinate. |
+| `End` | End coordinate. |
+
+#### Inheritance & Variant Class
+
+| Column | Description |
+|---|---|
+| `dominant` | 1 = dominant, 0 = not dominant. |
+| `recessive` | 1 = recessive, 0 = not recessive. |
+| `zyg` | Zygosity flag: 1 = heterozygous site, 0 = otherwise. |
+| `cons_frameshift_variant` | 1 = frameshift variant, 0 = not. |
+| `frame_shift` | Whether the variant causes a frameshift. |
+| `transcript_score` | Score for the transcript, computed as a weighted sum based on MANE status and the presence of HGVSp/HGVSc. |
+
+#### Gene Constraint Metrics (gnomAD)
+
+| Column | Description |
+|---|---|
+| `gnomadGenePLI` | gnomAD pLI score (probability of loss-of-function intolerance). |
+| `gnomadGeneOELof` | gnomAD observed/expected ratio for loss-of-function variants. |
+| `gnomadGeneOELofUpper` | Upper bound of the gnomAD LOEUF (O/E LoF confidence interval). |
+
+#### Diagnostic Engine (Mixture-of-Experts) Scores
+
+The overall score comes from a Mixture-of-Experts (MoE) model. Each expert module produces a score and a rank.
+
+| Column | Description |
+|---|---|
+| `overall_logit` | Final-layer logit from the MoE model (interconvertible with `overall_prob`). |
+| `overall_prob` | Overall probability (the sigmoid-transformed `overall_logit`). |
+| `score_Database` / `rank_Database` | Score / rank from the Database module. |
+| `score_Genetics` / `rank_Genetics` | Score / rank from the Genetics module. |
+| `score_InSilico` / `rank_InSilico` | Score / rank from the InSilico module. |
+| `score_Overview` / `rank_Overview` | Score / rank from the Overview module. |
+| `score_Phenotype` / `rank_Phenotype` | Score / rank from the Phenotype module. |
+| `Diagnostic_Engine_Rank` | Final rank from the MoE model. |
+
+#### RNA — OUTRIDER (expression outliers)
+
+> All `Outrider_*` columns require the RNA module; they are empty if RNA was not run.
+
+| Column | Description |
+|---|---|
+| `Outrider_pValue` | OUTRIDER p-value. |
+| `Outrider_padjust` | OUTRIDER adjusted p-value. |
+| `Outrider_zScore` | OUTRIDER z-score (from its fitted distribution). |
+| `Outrider_l2f` | Log2 fold change. |
+| `Outrider_rawcounts` | Raw read counts. |
+| `Outrider_RawZscore` | Z-score computed directly from raw values (differs from `Outrider_zScore` because OUTRIDER's model z-score is not based on a plain normal distribution). |
+
+#### RNA — FRASER 2.0 (splicing outliers)
+
+> All `Fraser_*` columns come from FRASER 2.0 and require the RNA module; empty if RNA was not run. Names follow FRASER's own terminology.
+
+| Column | Description |
+|---|---|
+| `Fraser_GenePvalue` | Gene-level p-value. |
+| `Fraser_pvaluesBetaBinomial_jaccard` | Beta-binomial p-value for the Jaccard metric. |
+| `Fraser_psi5` / `Fraser_psi3` | PSI values for 5′ / 3′ splice-site usage. |
+| `Fraser_rawOtherCounts_psi5` / `Fraser_rawOtherCounts_psi3` | Raw counts of "other" reads for the psi5 / psi3 metrics. |
+| `Fraser_rawCountsJnonsplit` | Raw non-split read counts at the junction. |
+| `Fraser_jaccard` | Jaccard splicing metric. |
+| `Fraser_rawOtherCounts_jaccard` | Raw "other" counts for the Jaccard metric. |
+| `Fraser_delta_jaccard` / `Fraser_delta_psi5` / `Fraser_delta_psi3` | Deviation (delta) from expected value for each metric. |
+| `Fraser_predictedMeans_jaccard` | Model-predicted mean for the Jaccard metric. |
+| `Fraser_junction_start` / `Fraser_junction_end` | Splice junction start / end coordinates. |
+
+#### RNA — Allele-Specific Expression (ASE)
+
+> `ASE_*` columns come from the ASE analysis.
+
+| Column | Description |
+|---|---|
+| `ASE_REF` / `ASE_ALT` | Reference / alternate allele. |
+| `ASE_REF_COUNT` / `ASE_ALT_COUNT` | Read counts supporting the reference / alternate allele. |
+| `ASE_ALT_RATIO` | Fraction of reads supporting the alternate allele. |
+| `ASE_PVAL` | P-value for allelic imbalance. |
+| `IS_MAE` | Whether the variant shows mono-allelic expression. |
+
+#### RNA — Read Support Counts
+
+> All `ref_*` / `alt_*` columns are RNA-derived; 0 when the RNA module was not run.
+
+| Column | Description |
+|---|---|
+| `ref_count_max` / `ref_count_mean` / `ref_count_min` | Max / mean / min reference-allele read counts. |
+| `alt_count_max` / `alt_count_mean` / `alt_count_min` | Max / mean / min alternate-allele read counts. |
+
+#### Candidate Selection & Compound Heterozygosity
+
+| Column | Description |
+|---|---|
+| `is_compound_het_group` | Whether the variant belongs to a compound-het group. |
+| `evidence_rules` | Reason(s) the variant was selected as a disease candidate. |
+| `find_compound_het` | Whether the variant is part of a compound het. |
+| `partner` | The paired variant, if this is a compound het. |
+| `compound_het_group_id` | Group ID for the compound-het group, if applicable. |
+
+#### LLM Agent Judgments
+
+> These columns hold conclusions from the LLM agents. An **empty** value means the candidate did not meet the prerequisites for that judgment (e.g. missing database info). When populated, conclusions may be one of: supporting, opposing, neutral, relevant, not relevant, insufficient information, etc.
+
+| Column | Description |
+|---|---|
+| `Database_Reasoning` / `Database_Conclusion` | Reasoning / conclusion from the Database agent. |
+| `Database_Zygosity` | Zygosity call from the Database agent. |
+| `HPO_Reasoning` / `HPO_Conclusion` | Reasoning / conclusion from the HPO (phenotype) agent. |
+| `OMIM_Reasoning` / `OMIM_Conclusion` | Reasoning / conclusion from the OMIM agent. |
+| `Literature_Reasoning` / `Literature_Conclusion` | Reasoning / conclusion from the Literature agent. |
+| `Insilico_Reasoning` / `Insilico_Conclusion` | Reasoning / conclusion from the in-silico prediction agent. |
+| `RNA_GeneLevel_Reasoning` / `RNA_GeneLevel_Event` / `RNA_GeneLevel_Conclusion` | Gene-level reasoning / event / conclusion from the RNA agent. |
+| `RNA_VarLevel_Reasoning` / `RNA_VarLevel_Event` / `RNA_VarLevel_Conclusion` | Variant-level reasoning / event / conclusion from the RNA agent. |
+
+#### Flags & Tiering
+
+| Column | Description |
+|---|---|
+| `has_repeat_motif` | Whether a repeat motif is present (requires RNA; empty otherwise). |
+| `misscall_rna_flag` | Whether the variant is likely a miscall (requires RNA; empty otherwise). |
+| `new_diseasegene_flag` | Whether this is a novel disease gene. |
+| `omim_flag` | Whether the gene is an OMIM gene. |
+| `strong_nom_flag` | Whether this is a strong candidate. |
+| `Tier` | Grouping by evidence strength: 1 = most relevant, 2 = intermediate, 3 = least relevant / least evidence. |
+| `new_rank` | Updated per-gene rank. |
+
+#### Pairwise Comparison Module
+
+> All `PairWise*` / `pairwise_*` columns come from the pairwise (head-to-head) comparison module.
+
+| Column | Description |
+|---|---|
+| `PairWiseScore` | Pairwise comparison score. |
+| `PairWiseWins` / `PairWiseLosses` / `PairWiseTies` | Number of head-to-head wins / losses / ties. |
+| `PairWiseEntityRank` | Final rank from the pairwise comparison. |
+| `PairWiseWithinEntityRank` | For a compound het, whether this variant is the higher-ranked (1) or lower-ranked (2) member. |
+| `pairwise_entity_id` | Entity ID in the comparison module. |
+| `pairwise_entity_type` | Entity type in the comparison module. |
