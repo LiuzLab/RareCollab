@@ -1,0 +1,5 @@
+sampleID,rna_path,strand,pairedEnd
+sample_101,/path/.../sample_101.bam,auto,auto
+sample_102,/path/.../sample_102.bam,forward,auto
+sample_103,/path/.../sample_103.bam,unstranded,yes
+sample_104,/path/.../sample_104.bam,reverse,no

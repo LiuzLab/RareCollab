@@ -1,0 +1,6 @@
+sampleID,vcf_path,hpo_path,rna_path,strand,pairedEnd
+sample_1,/path/.../sample_1.vcf.gz,/path/.../sample_1.hpo.txt,/path/.../sample_1.bam,auto,auto
+sample_2,/path/.../sample_2.vcf.gz,/path/.../sample_2.hpo.txt,/path/.../sample_2.bam,auto,yes
+sample_3,/path/.../sample_3.vcf.gz,/path/.../sample_3.hpo.txt,/path/.../sample_3.bam,unstranded,yes
+sample_4,/path/.../sample_4.vcf.gz,/path/.../sample_4.hpo.txt,/path/.../sample_4.bam,forward,no
+sample_5,/path/.../sample_5.vcf.gz,/path/.../sample_5.hpo.txt,/path/.../sample_5.bam,reverse,no
