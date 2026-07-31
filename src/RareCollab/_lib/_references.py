@@ -56,12 +56,14 @@ class VepReferences:
 @dataclass(frozen=True)
 class RareCollabReferences:
     gencode_annot: Path
+    gene_ranges: Path
     mane_transcript: Path
     moe_model: Path
     clinvar_feather: Path  
     omim_disease: Path
     hpo_lib: Path
     hpo_genes: Path
+    clingen_dosage: Path
 
 @dataclass(frozen=True)
 class AimReferences:
@@ -87,3 +89,6 @@ class FastaReferences:
     fasta: Path
     fai: Path
     dict: Path
+    fasta_ucsc: Path
+    fai_ucsc: Path
+    dict_ucsc: Path

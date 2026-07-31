@@ -339,9 +339,10 @@ def filter_one(sample_id,  moe_path, expression_path, splicing_path, ase_path,
                output_path, overwrite=False):
     if output_path.exists() and not overwrite:
         return {
-            "has_expression": 'Skip',
-            "has_splicing": 'Skip',
-            "has_ase": 'Skip',
+            "has_expression": expression_path is not None and expression_path.exists(),
+            "has_splicing": splicing_path is not None and splicing_path.exists(),
+            "has_ase": ase_path is not None and ase_path.exists(),
+            "reused": True,
         }
     # Load DNA MoE scores
     data = pd.read_feather(moe_path)
@@ -516,40 +517,41 @@ def filter_one(sample_id,  moe_path, expression_path, splicing_path, ase_path,
         "has_expression": has_RNA_expression,
         "has_splicing": has_RNA_splicing,
         "has_ase": has_RNA_ASE,
+        "reused": False,
     }
 
 def Candidates(samplesheet, work_dir, config=None, overwrite=False):
     default_config = {"candidates_workers": 1}
     cfg = {**default_config, **(config or {})}
-    
+
     work_dir = Path(work_dir)
-    
+
     if "moe_score_path" not in samplesheet.columns:
         raise ValueError(
             "samplesheet missing 'moe_score_path' column. "
             "Run DiagnosticEngine.MoE first."
         )
-    
+
     outpath = work_dir / "Diagnostic_results" / "Candidates"
     outpath.mkdir(parents=True, exist_ok=True)
-    
+
     print(f"Scanning Candidates ...")
-    
+
     output_paths = {}
     futures_map = {}
     ok = fail = 0
-    
+
     with ThreadPoolExecutor(max_workers=cfg["candidates_workers"]) as ex:
         for row in samplesheet.itertuples(index=True):
             sample_id = row.sampleID
             moe_path = Path(row.moe_score_path)
             output_path = outpath / f"{sample_id}_nomcand.feather"
-            
+
             # RNA paths optional — pass None if column missing or value NaN
             expr_path = _get_optional_path(row, "rna_expression_path")
             splicing_path = _get_optional_path(row, "rna_splicing_path")
             ase_path = _get_optional_path(row, "rna_ase_path")
-            
+
             fut = ex.submit(
                 filter_one, sample_id, moe_path,
                 expr_path, splicing_path, ase_path,
@@ -557,7 +559,7 @@ def Candidates(samplesheet, work_dir, config=None, overwrite=False):
             )
             futures_map[fut] = (row.Index, sample_id, output_path)
         sample_info = {}
-        
+
         with tqdm(total=len(futures_map), desc="Detecting Candidates") as pbar:
             for fut in as_completed(futures_map):
                 row_idx, sample_id, out_path = futures_map[fut]
@@ -572,29 +574,41 @@ def Candidates(samplesheet, work_dir, config=None, overwrite=False):
                           f"{type(e).__name__}: {e}")
                 pbar.update(1)
                 pbar.set_postfix(ok=ok, fail=fail)
-    
+
     if fail > 0:
         raise RuntimeError(f"Candidates failed for {fail} sample(s).")
+
+    # Aggregate rather than per-sample: a hundred-sample cohort should not
+    # produce a hundred lines, and the counts are what actually matter.
     print()
-    for sample_id, info in sample_info.items():
-        print(f"  {sample_id}: hasDNA=True, "
-              f"hasExpression={info['has_expression']}, "
-              f"hasSplicing={info['has_splicing']}, "
-              f"hasASE={info['has_ase']}")
+    n = len(sample_info)
+    for label, key in (("DNA", None),
+                       ("Expression", "has_expression"),
+                       ("Splicing", "has_splicing"),
+                       ("ASE", "has_ase")):
+        n_yes = n if key is None else sum(
+            1 for info in sample_info.values() if info[key]
+        )
+        print(f"  {label:<11} {n_yes}/{n} sample(s)")
+
+    n_reused = sum(1 for info in sample_info.values() if info.get("reused"))
+    if n_reused:
+        print(f"  ({n_reused} existing output(s) reused; "
+              f"pass overwrite=True to rebuild)")
 
     # Update samplesheet
     samplesheet = samplesheet.copy()
     samplesheet["candidates_path"] = None
     for row_idx, path in output_paths.items():
         samplesheet.loc[row_idx, "candidates_path"] = path
-    
+
     # Atomic write samplesheet
     samplesheet_path = work_dir / "samplesheet_with_paths.csv"
     tmp = work_dir / ".samplesheet_with_paths.csv.tmp"
     samplesheet.to_csv(tmp, index=False)
     os.replace(tmp, samplesheet_path)
     print(f"Updated samplesheet: {samplesheet_path}")
-    
+
     print(f"--Candidate Filtering DONE--\n")
     return samplesheet
 

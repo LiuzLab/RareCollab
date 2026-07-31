@@ -19,7 +19,12 @@ from tqdm import tqdm
 def load_LLM_res(sub_root_path, model_type, candidate_type):
     res = []
     label_reason, label_conclusion = model_type + "_Reasoning", model_type + "_Conclusion"
-    loading_list = {p.name.split('.json')[0]: p for p in Path(sub_root_path).iterdir() if p.suffix == '.json'}
+    sub_root_path = Path(sub_root_path)
+    loading_list = (
+        {p.name.split('.json')[0]: p for p in sub_root_path.iterdir()
+         if p.suffix == '.json'}
+        if sub_root_path.is_dir() else {}
+    )
     for GeneName, loading_path in loading_list.items():
         with loading_path.open("r", encoding='utf-8') as f:
             Evaluation = json.load(f)
@@ -673,15 +678,26 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
         ])
     
     AQ_path = work_dir / "Agents" / "RNA" / "AlleleQuantification" / f"{sample_id}.feather"
+    aq_cols = ['ref_count_max', 'ref_count_mean', 'ref_count_min',
+               'alt_count_max', 'alt_count_mean', 'alt_count_min']
     if AQ_path.exists():
         AlleleQuant = pd.read_feather(AQ_path).reset_index(drop=True)
+        # Attached by position, not by varId: a variant appears once per
+        # transcript, so varId is not unique and a merge would multiply rows.
+        # That makes row order load-bearing, which is worth verifying rather
+        # than trusting - a misalignment would attach one variant's read counts
+        # to another with nothing to show for it.
+        if (len(AlleleQuant) != len(data)
+                or AlleleQuant["varId"].astype(str).tolist()
+                != data["varId"].astype(str).tolist()):
+            raise ValueError(
+                f"{sample_id}: allele quantification is out of step with the "
+                f"candidate table ({len(AlleleQuant)} vs {len(data)} rows). "
+                f"Delete {AQ_path} and re-run RNAAgent.RunAgent."
+            )
+        AlleleQuant = AlleleQuant[aq_cols]
     else:
-        AlleleQuant = pd.DataFrame({
-            'varId': ['None'], 'geneSymbol': None, 'transcript_id': None,
-            'ref_count_max': 0, 'ref_count_mean': 0, 'ref_count_min': 0,
-            'alt_count_max': 0, 'alt_count_mean': 0, 'alt_count_min': 0,
-        })
-    AlleleQuant = AlleleQuant.drop(columns=['varId', 'geneSymbol', 'transcript_id'])
+        AlleleQuant = pd.DataFrame(0.0, index=range(len(data)), columns=aq_cols)
     data = pd.concat([data, AlleleQuant], axis=1)
 
     # Merge agent results

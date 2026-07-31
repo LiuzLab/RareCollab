@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "RareCollab"
-version = "0.2.1"
+version = "1.0.0"
 description = "RareCollab - A Multimodal Diagnostic Copilot for Mendelian Disorders"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -32,3 +32,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"RareCollab._rscript" = ["*.R"]
