@@ -12,9 +12,20 @@ Our paper is available on **arXiv**: <https://arxiv.org/abs/2602.04058>
 
 Before running RareCollab, please prepare the following files and directories:
 
-1. Please download the RareCollab-data-dependencies from s3://rarecollab-data-dependencies-1.0-public/.
+1. **Download the RareCollab data dependencies.** No AWS account is needed — `--no-sign-request` makes the request anonymous. Install the [AWS CLI](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html) first if you do not have it, then:
 
-2. Create an NCBI API key using your email address from [NCBI API Keys](https://www.ncbi.nlm.nih.gov/datasets/docs/v2/api/api-keys/). This step is optional, but it can speed up searches using the NCBI and Entrez APIs.
+   ```bash
+   # Change to the directory where you want the data
+   cd <desired/folder/path>
+
+   # Download
+   aws s3 sync s3://rarecollab-data-dependencies-1.0-public/ . --no-sign-request
+   ```
+
+   The directory you download into is the `ref_dir` passed to
+   `RareCollab.Setup.ResolveReferenceInputs` in Step 1.
+
+2. **Create** an NCBI API key using your email address from [NCBI API Keys](https://www.ncbi.nlm.nih.gov/datasets/docs/v2/api/api-keys/). This step is optional, but it can speed up searches using the NCBI and Entrez APIs.
 
 # Usage
 
