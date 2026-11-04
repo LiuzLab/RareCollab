@@ -34,11 +34,12 @@ analysis_name <- args[6]
 
 dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-# Counting runs serially. Split reads are already cached by count_split_one.R,
-# so this pass only reads them back; non-split counting still happens in this
-# process, and serialising it keeps the peak at one sample rather than letting
-# an ever-growing R heap accumulate several high-water marks. The fit further
-# down re-registers a parallel backend, being CPU-bound but memory-cheap.
+# The default stays serial: everything between here and the fit works on the
+# whole junction x sample matrix, and forking with that resident is what the
+# serial choice was defending against. Non-split counting is the exception -
+# per-sample, and through Rsubread, whose memory stays flat - so it gets its
+# own backend at the call site below. The fit further down re-registers a
+# parallel backend globally, being CPU-bound but memory-cheap.
 register(SerialParam())
 
 say <- function(...) message(format(Sys.time(), "[%H:%M:%S] "), ...)
@@ -109,7 +110,12 @@ say("Assembling counts (split reads come from cache; non-split runs now)")
 # They carry no interpretable splicing for a rare-disease readout and inflate
 # both the junction map and memory. FRASER re-applies this when reading a
 # cached count, so caches built either way stay consistent.
-fds <- countRNAData(fds, keepNonStandardChromosomes = FALSE)
+#
+# Non-split counting is the one step here worth parallelising. Workers are
+# capped at the sample count: forking more than there are samples buys nothing
+# and costs an address space each.
+count_param <- MulticoreParam(workers = max(1L, min(n_threads, nrow(anno))))
+fds <- countRNAData(fds, keepNonStandardChromosomes = FALSE, BPPARAM = count_param)
 
 say("Computing PSI and Intron Jaccard Index")
 fds <- calculatePSIValues(fds)

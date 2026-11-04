@@ -239,6 +239,18 @@ def _simple_repeat_anno(sample_df, simple_repeats_by_chrom):
     return sample_df
 
 
+def merge_outputs(sample_id, work_dir):
+    """
+    Where MERGE_SCORES_BY_CHROMOSOME's outputs land for one sample:
+    (matrix_txt, scores_long).
+
+    Shared with the parallel dispatcher so it can tell what is already done
+    without opening a process pool.
+    """
+    sample_dir = Path(work_dir) / "merged" / str(sample_id)
+    return (sample_dir / f"{sample_id}.matrix.txt",
+            sample_dir / f"{sample_id}.scores.txt.gz")
+
 # ----------------------------------------------------------------------
 # Main: per-sample merge pipeline
 # ----------------------------------------------------------------------
@@ -255,20 +267,17 @@ def MERGE_SCORES_BY_CHROMOSOME(sample_id, tier_paths, score_paths, phrank_path,
     Direct port of AIM's MERGE_SCORES_BY_CHROMOSOME + post_processing.py.
     """
     work_dir = Path(work_dir)
-    sample_dir = work_dir / "merged" / sample_id
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    output_path = sample_dir / f"{sample_id}.matrix.txt"
+    output_path, scores_long_path = merge_outputs(sample_id, work_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
         if output_path.exists() or output_path.is_symlink():
             output_path.unlink()
-    else:
-        scores_long_path = sample_dir / f"{sample_id}.scores.txt.gz"
-        if output_path.exists() and scores_long_path.exists():
-            return {
-                "matrix_txt_path": str(output_path),
-                "scores_long_path": str(scores_long_path),
-            }
+    elif output_path.exists() and scores_long_path.exists():
+        return {
+            "matrix_txt_path": str(output_path),
+            "scores_long_path": str(scores_long_path),
+        }
 
     # Lazy-load shared resources if not provided
     if any(x is None for x in [feature_stats, net_norm, cor_gene_id,
@@ -297,7 +306,6 @@ def MERGE_SCORES_BY_CHROMOSOME(sample_id, tier_paths, score_paths, phrank_path,
     if merged.columns[0].startswith("Unnamed"):
         merged = merged.drop(columns=merged.columns[0])
     
-    scores_long_path = sample_dir / f"{sample_id}.scores.txt.gz"
     merged.to_csv(scores_long_path, sep="\t", index=False, compression="gzip")
 
     # ---- STEP 3: mod5 diffusion (phrank → diffuse_Phrank_STRING) ----
@@ -678,13 +686,29 @@ def run_merge_parallel(samplesheet, work_dir, references, ref_ver,
     results = {}
     ok = fail = 0
 
+    pending = []
+    for row in samplesheet.itertuples(index=True):
+        matrix_txt, scores_long = merge_outputs(row.sampleID, work_dir)
+        if not overwrite and matrix_txt.exists() and scores_long.exists():
+            results[row.Index] = {"matrix_txt_path": str(matrix_txt),
+                                  "scores_long_path": str(scores_long)}
+            continue
+        pending.append(row)
+    
+    if not pending:
+        print(f"MERGE SCORES: all {len(results)} sample(s) already computed.")
+        return results
+    if results:
+        print(f"MERGE SCORES: {len(results)} sample(s) cached, "
+              f"{len(pending)} to compute.")
+
     with ProcessPoolExecutor(
-        max_workers=max_workers,
+        max_workers=min(max_workers, len(pending)),
         initializer=_init_merge_worker,
         initargs=(references, ref_ver),
         mp_context=mp.get_context("spawn"),
     ) as ex:
-        for row in samplesheet.itertuples(index=True):
+        for row in pending:
             future = ex.submit(
                 _merge_worker_run,
                 row.sampleID,

@@ -25,6 +25,7 @@ from scipy.stats import binomtest
 from tqdm import tqdm
 
 from ._cpu import get_available_cpus
+from ._analysis import DEFAULT_ANALYSIS, analysis_subdir, row_analysis
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,58 @@ def run_cmd(cmd, timeout=None):
     """Run a command and return CompletedProcess; never raises on non-zero."""
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
+def run_cmd_streamed(cmd, log, timeout=None):
+    """
+    Run a command, relaying its output to an open log file as it arrives.
+
+    subprocess.run holds everything until the process exits, so a GATK step
+    that runs for hours shows nothing at all until it is over - including its
+    ProgressMeter, which is the only way to tell a slow step from a stuck one.
+    stdbuf forces line buffering on a child that would otherwise switch to
+    block buffering on noticing its output is a pipe.
+
+    The timeout needs its own watchdog: a process that hangs without printing
+    blocks in the read loop below, where subprocess.run's timeout would have
+    fired. The watchdog kills it and TimeoutExpired is raised as before, so
+    callers need no change.
+
+    Returns a CompletedProcess carrying the combined output as stdout. stderr
+    comes back empty because the two streams are merged, which is what keeps
+    their interleaving - and therefore the log - readable.
+    """
+    log.write(f"$ {' '.join(cmd)}\n")
+    log.flush()
+
+    prefix = ["stdbuf", "-oL", "-eL"] if shutil.which("stdbuf") else []
+    proc = subprocess.Popen(prefix + cmd, stdout=subprocess.PIPE,
+                            stderr=subprocess.STDOUT, text=True, bufsize=1)
+
+    timed_out = threading.Event()
+
+    def _kill():
+        timed_out.set()
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, _kill) if timeout else None
+    if watchdog is not None:
+        watchdog.start()
+
+    collected = []
+    try:
+        for line in proc.stdout:
+            log.write(line)
+            log.flush()
+            collected.append(line)
+        proc.wait()
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
+        log.write("\n")
+        log.flush()
+
+    if timed_out.is_set():
+        raise subprocess.TimeoutExpired(cmd, timeout)
+    return subprocess.CompletedProcess(cmd, proc.returncode, "".join(collected), "")
 
 def subprocess_detail(result):
     """
@@ -170,6 +223,30 @@ def recommend_bam_parallelism(n_bam, max_workers=None, threads_per_sample=None):
         threads_per_sample = max(1, min(4, total // max(1, max_workers)))
     return max_workers, threads_per_sample
 
+def memory_safe_workers(bam_paths, cap=8):
+    """
+    How many split-counting processes this machine can hold at once.
+
+    Peak RSS per process tracks the largest BAM rather than the mean - one
+    unlucky batch of big samples is what kills a run - and sits at roughly 2.5x
+    the on-disk size, so the budget is set against the biggest file.
+
+    Returns the core-count cap unmodified when the sizes or MemAvailable cannot
+    be read, which is what the caller did before this was a function.
+    """
+    workers = max(1, min(get_available_cpus(), cap))
+    try:
+        largest = max(Path(p).stat().st_size for p in bam_paths)
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    avail = int(line.split()[1]) * 1024
+                    workers = max(1, min(workers,
+                                         int(avail * 0.7 // (largest * 2.5))))
+                    break
+    except (OSError, ValueError):
+        pass
+    return workers
 
 def bam_fingerprint(bam_path):
     """Cheap identity for a BAM, used to invalidate the cache when it changes."""
@@ -524,47 +601,385 @@ def process_one_sample(row, out_root, overwrite, threads, max_reads, target_info
     record["from_cache"] = False
     return record, notes
 
+# ---------------------------------------------------------------------------
+# ProcessBAM: contig normalisation
+# ---------------------------------------------------------------------------
+
+MAIN_CONTIGS_BARE = [str(i) for i in range(1, 23)] + ["X", "Y", "M", "MT"]
+
+
+def main_sequence_dict(reference_dict, out_dict, style):
+    """
+    Write a sequence dictionary holding only the main chromosomes.
+
+    Built once per work directory and shared by every sample of that naming
+    style. ReorderSam drops whatever this omits, so this file is both the
+    target order and the filter.
+    """
+    out_dict = Path(out_dict)
+    if out_dict.exists():
+        return out_dict
+
+    wanted = ({f"chr{c}" for c in MAIN_CONTIGS_BARE} if style == "UCSC"
+              else set(MAIN_CONTIGS_BARE))
+    lines, kept = [], []
+    with open(reference_dict) as fh:
+        for line in fh:
+            if line.startswith("@SQ"):
+                name = next((f[3:] for f in line.rstrip("\n").split("\t")
+                             if f.startswith("SN:")), None)
+                if name in wanted:
+                    kept.append(line)
+            else:
+                lines.append(line)
+
+    if not kept:
+        raise RuntimeError(f"no main chromosomes found in {reference_dict} under "
+                           f"{style} naming - is the reference the right build?")
+
+    hd = [l for l in lines if l.startswith("@HD")] or ["@HD\tVN:1.6\tSO:unsorted\n"]
+    rest = [l for l in lines if not l.startswith("@HD")]
+
+    out_dict.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out_dict.with_suffix(".tmp.dict")
+    tmp.write_text("".join(hd + kept + rest))
+    os.replace(tmp, out_dict)
+    return out_dict
+
+
+def dict_contigs(dict_path):
+    """[(name, length), ...] from a .dict, in file order."""
+    out = []
+    with open(dict_path) as fh:
+        for line in fh:
+            if not line.startswith("@SQ"):
+                continue
+            name = length = None
+            for field in line.rstrip("\n").split("\t"):
+                if field.startswith("SN:"):
+                    name = field[3:]
+                elif field.startswith("LN:"):
+                    length = int(field[3:])
+            if name:
+                out.append((name, length or 0))
+    return out
+
+
+def bam_contigs(bam_path):
+    """[(name, length), ...] in the BAM's own order."""
+    result = run_cmd(["samtools", "view", "-H", str(bam_path)])
+    if result.returncode != 0:
+        raise RuntimeError(f"could not read BAM header: {bam_path}")
+    out = []
+    for line in result.stdout.splitlines():
+        if not line.startswith("@SQ"):
+            continue
+        name = length = None
+        for field in line.split("\t"):
+            if field.startswith("SN:"):
+                name = field[3:]
+            elif field.startswith("LN:"):
+                length = int(field[3:])
+        if name:
+            out.append((name, length or 0))
+    return out
+
+
+def needs_normalising(contigs, target):
+    """
+    Why this BAM has to be rewritten, as a string; empty means it is fine.
+
+    Two separate problems, both silent. GATK sorts intervals into the
+    reference's contig order and then walks the BAM forward only, so a BAM
+    ordered differently loses every contig sitting earlier in its own ordering
+    than the one before it: a lexicographically ordered BAM drops chr10 through
+    chr22, exits 0, and says nothing. Contigs the reference lacks are the
+    other, and those abort the run hours in with "Contig ... not present in the
+    sequence dictionary".
+
+    A length mismatch is neither, and raises: it means the BAM was aligned
+    against a different genome build, which no amount of reordering repairs.
+    """
+    bam_lengths = dict(contigs)
+    bam_names = [n for n, _ in contigs]
+    target_names = [n for n, _ in target]
+    shared = [c for c in target_names if c in bam_lengths]
+
+    if not shared:
+        raise RuntimeError(f"the BAM shares no main chromosome with the reference "
+                           f"(BAM: {bam_names[:3]}..., "
+                           f"reference: {target_names[:3]}...)")
+
+    mismatched = [c for c, L in target if c in bam_lengths and bam_lengths[c] != L]
+    if mismatched:
+        raise RuntimeError(f"contig lengths differ from the reference for "
+                           f"{mismatched[:3]} - the BAM was aligned against a "
+                           f"different genome build")
+
+    reasons = []
+    if [c for c in bam_names if c in set(shared)] != shared:
+        reasons.append("contig order differs from the reference")
+    extra = len(bam_names) - len(shared)
+    if extra:
+        reasons.append(f"{extra} contig(s) absent from the reference")
+    return "; ".join(reasons)
+
+
+def reorder_bam(bam_path, out_bam, seq_dict):
+    """
+    Rewrite the BAM against `seq_dict`, keeping only the contigs it lists.
+
+    ReorderSam is the only tool that does this. `samtools view` keeps each
+    record's reference ID as it was under the input header and `reheader` only
+    swaps the header text, so between them the IDs end up pointing at the wrong
+    sequences: the result passes `samtools quickcheck` and fails on the first
+    read.
+
+    Written under a temporary name and renamed on success, so an interrupted
+    run leaves nothing that looks finished. The BAM is renamed last, making it
+    the completion marker. The index moves to the samtools convention
+    (<file>.bam.bai), which htslib looks for first and find_bam_index accepts.
+    """
+    out_bam = Path(out_bam)
+    tmp_bam = out_bam.parent / (out_bam.stem + ".tmp.bam")
+    tmp_idx = out_bam.parent / (out_bam.stem + ".tmp.bai")
+
+    try:
+        # No compression_level override: level 5 took 90% longer for 13% less
+        # space than the default, and the default already comes out smaller
+        # than the input in practice.
+        result = subprocess.run(
+            ["gatk", "ReorderSam", "-I", str(bam_path), "-O", str(tmp_bam),
+             "-SD", str(seq_dict),
+             "--ALLOW_INCOMPLETE_DICT_CONCORDANCE", "true",
+             "--CREATE_INDEX", "true"],
+            capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(f"ReorderSam failed: {result.stderr.strip()[-300:]}")
+        if not tmp_bam.exists():
+            raise RuntimeError("ReorderSam exited cleanly but wrote no BAM")
+
+        if tmp_idx.exists():
+            os.replace(tmp_idx, Path(str(out_bam) + ".bai"))
+        os.replace(tmp_bam, out_bam)
+    finally:
+        tmp_bam.unlink(missing_ok=True)
+        tmp_idx.unlink(missing_ok=True)
+
+    return out_bam
+
+
+def normalise_one_bam(sample_id, bam_path, out_root, seq_dict, target, overwrite):
+    """
+    Normalise one sample's BAM if it needs it.
+
+    Returns (sample_id, path_to_use, status, detail). Never raises: a failure
+    costs one sample its normalisation rather than the batch, and that sample
+    keeps its original path so the rest of the pipeline still runs for it.
+    """
+    sample_dir = Path(out_root) / str(sample_id)
+    out_bam = sample_dir / f"{sample_id}.normalised.bam"
+    out_idx = Path(str(out_bam) + ".bai")
+
+    try:
+        reason = needs_normalising(bam_contigs(bam_path), target)
+        if not reason:
+            return sample_id, str(bam_path), "already matches", ""
+
+        # Both files have to be there, and the header has to be the one this
+        # code produces: a copy left by an interrupted attempt could carry the
+        # right name and the wrong contigs, which is the very failure being
+        # fixed here.
+        if out_bam.exists() and out_idx.exists() and not overwrite:
+            try:
+                if bam_contigs(out_bam) == target:
+                    return sample_id, str(out_bam), "reused", reason
+            except Exception:
+                pass
+            out_bam.unlink(missing_ok=True)
+            out_idx.unlink(missing_ok=True)
+
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        reorder_bam(bam_path, out_bam, seq_dict)
+        return sample_id, str(out_bam), "normalised", reason
+
+    except Exception as exc:
+        return sample_id, str(bam_path), "failed", str(exc)
+
+
+def normalise_bams_parallel(cohort, out_root, fasta_references,
+                            overwrite=False, max_workers=None):
+    """
+    Rewrite every BAM in the cohort whose contigs disagree with the reference.
+
+    Returns {sampleID: path later steps should read} - the original where it
+    already matches, the normalised copy otherwise, and the original again for
+    anything that failed.
+    """
+    out_root = Path(out_root)
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # One dictionary per naming style, shared by every sample using it.
+    dicts, targets = {}, {}
+    for style in set(cohort["SeqLevelStyle"]) | {"UCSC"}:
+        if style == "unknown":
+            continue
+        ref_dict = (fasta_references.dict_ucsc if style == "UCSC"
+                    else fasta_references.dict)
+        path = main_sequence_dict(ref_dict,
+                                  out_root / f"_main_{style.lower()}.dict", style)
+        dicts[style] = path
+        targets[style] = dict_contigs(path)
+
+    if max_workers is None:
+        # Each sample reads and rewrites a whole BAM, so this is bound by
+        # storage bandwidth rather than by cores.
+        max_workers = max(1, min(len(cohort), get_available_cpus() // 4, 8))
+
+    print(f"\nChecking {len(cohort)} BAM(s) against the reference "
+          f"({max_workers} at a time)")
+
+    results, failures, reasons = {}, [], {}
+    tally = {"already matches": 0, "reused": 0, "normalised": 0, "failed": 0}
+
+    bar = tqdm(total=len(cohort), unit="sample", desc="normalising BAMs",
+               ascii=True,
+               bar_format="{desc:<38} {bar} {n_fmt}/{total_fmt} [{elapsed}]")
+    stop = threading.Event()
+    threading.Thread(target=lambda: [bar.refresh() for _ in
+                                     iter(lambda: stop.wait(15), True)],
+                     daemon=True).start()
+    try:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = []
+            for _, row in cohort.iterrows():
+                style = row["SeqLevelStyle"]
+                style = "UCSC" if style == "unknown" else style
+                futures.append(pool.submit(
+                    normalise_one_bam, str(row["sampleID"]), str(row["rna_path"]),
+                    out_root, dicts[style], targets[style], overwrite))
+            for future in as_completed(futures):
+                sid, path, status, detail = future.result()
+                results[sid] = path
+                tally[status] += 1
+                if status == "failed":
+                    failures.append((sid, detail))
+                    bar.write(f"  FAILED {sid}: {detail}")
+                elif detail:
+                    reasons[detail] = reasons.get(detail, 0) + 1
+                bar.update(1)
+    finally:
+        stop.set()
+        bar.close()
+
+    print("  " + ", ".join(f"{v} {k}" for k, v in tally.items() if v))
+    for reason, n in reasons.items():
+        print(f"  {n} sample(s): {reason}")
+    if failures:
+        print(f"  WARNING: {len(failures)} sample(s) kept their original BAM; "
+              f"GATK steps may silently drop contigs for them.")
+
+    return results
+
+# ---------------------------------------------------------------------------
+# Cohort-method result layout
+# ---------------------------------------------------------------------------
+
+def analysis_layout(root, analysis_name):
+    """
+    Split a cohort method's result root into shared and per-analysis halves.
+
+    analysis_name keys storage only - the same inputs give the same numbers
+    under any name. What it buys is two analyses coexisting in one work
+    directory without overwriting each other's cohort-level state, while still
+    sharing the per-sample read counts, which are a property of one BAM alone
+    and are the expensive part.
+
+        <root>/_cohort/                  shared across analyses: the read-count
+                                         cache, per-sample counting logs, and
+                                         FRASER's savedObjects, which FRASER
+                                         itself partitions by analysis name
+        <root>/<analysis_name>/_cohort/  this analysis: sample_anno.tsv,
+                                         cohort_roster.json, the run log and
+                                         the cohort-level results table
+        <root>/<analysis_name>/<id>/     this analysis: one table per case
+
+    The R scripts need no knowledge of any of this. Both already take
+    working_dir and out_dir as separate arguments and derive their per-sample
+    folders as dirname(out_dir), so pointing the two at different places is
+    enough.
+
+    Returns (shared_dir, analysis_dir, out_dir), all three created.
+    """
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", analysis_name):
+        raise ValueError(f"analysis_name must be filename-safe (letters, digits, "
+                         f"'.', '_', '-'); got {analysis_name!r}. It is used as "
+                         f"a directory name.")
+    if analysis_name == "_cohort":
+        raise ValueError("analysis_name '_cohort' collides with the shared "
+                         "cohort folder; pick another name.")
+    root = Path(root)
+    shared_dir = root / "_cohort"
+    analysis_dir = root / analysis_name
+    out_dir = analysis_dir / "_cohort"
+    shared_dir.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return shared_dir, analysis_dir, out_dir
 
 # ---------------------------------------------------------------------------
 # FRASER
 # ---------------------------------------------------------------------------
 
-def count_cached_samples(cohort_dir, analysis_name):
+def count_cached_samples(shared_dir, analysis_dir, analysis_name, sample_ids, case_ids):
     """
-    How many per-sample counting results exist, as a progress signal.
+    How many per-sample steps of stage 2 are finished, as a progress signal.
+
+    Counted by naming the files this cohort expects rather than globbing a
+    directory. The split-count cache is shared across analyses and routinely
+    holds samples this run has nothing to do with, so a glob of it reported
+    more finished samples than the bar had room for and pinned the bar at 100%
+    from its first tick.
+
+    Split counts are deliberately not counted at all: stage 1 finishes every
+    one of them before this starts, so they are a constant, and half a bar that
+    begins full is half a bar that can never move. What is left that happens
+    one sample at a time is non-split counting and the per-case export at the
+    end. The fit between them is matrix-wide and has no per-sample signal.
 
     Preferred over FRASER's own messages: BiocParallel's forked workers buffer
     message() output until a whole task chunk finishes, so a bar driven by them
-    lags by tens of minutes. Globs are prefixed deliberately - the non-split
-    cache stores .h5 not .RDS, and shares its directory with a
-    spliceSiteCoordinates.RDS that is not a sample.
+    lags by tens of minutes.
     """
-    cohort_dir = Path(cohort_dir)
-    split_dir = cohort_dir / "cache" / "splitCounts"
-    nonsplit_dir = cohort_dir / "cache" / "nonSplicedCounts" / analysis_name
-    done = 0
-    if split_dir.exists():
-        done += sum(1 for _ in split_dir.glob("splitCounts-*.RDS"))
-    if nonsplit_dir.exists():
-        done += sum(1 for _ in nonsplit_dir.glob("nonSplicedCounts-*.h5"))
+    nonsplit_dir = Path(shared_dir) / "cache" / "nonSplicedCounts" / analysis_name
+    analysis_dir = Path(analysis_dir)
+    done = sum(1 for sid in sample_ids
+               if (nonsplit_dir / f"nonSplicedCounts-{sid}.h5").exists())
+    done += sum(1 for sid in case_ids
+                if (analysis_dir / str(sid) / "junctions.tsv.gz").exists())
     return done
 
 
-def stream_r_output(proc, log, n_samples, cohort_dir, analysis_name):
+def stream_r_output(proc, log, shared_dir, analysis_dir, analysis_name, sample_ids, case_ids):
     """
     Relay the R subprocess through one in-place progress bar.
+
+    The bar advances one notch per sample counted and per case exported. The
+    fit sits between the two and moves nothing, being matrix-wide; the phase
+    description and the elapsed clock are the only signals there.
 
     Phase markers only change the bar's description, so a multi-hour run leaves
     one line rather than a scrolling wall. Everything reaches the log; only
     genuine errors interrupt.
     """
-    bar = tqdm(total=2 * n_samples, unit="sample", desc="starting", ascii=True,
+    bar = tqdm(total=len(sample_ids) + len(case_ids), unit="step",
+               desc="starting", ascii=True,
                bar_format="{desc:<38} {bar} {n_fmt}/{total_fmt} [{elapsed}]")
     stop = threading.Event()
 
     def watch():
         while not stop.wait(10):
-            done = min(count_cached_samples(cohort_dir, analysis_name), bar.total)
+            done = min(count_cached_samples(shared_dir, analysis_dir, analysis_name, sample_ids, case_ids),
+                       bar.total)
             if done > bar.n:
                 bar.update(done - bar.n)
             else:
@@ -590,7 +1005,8 @@ def stream_r_output(proc, log, n_samples, cohort_dir, analysis_name):
     return errors
 
 
-def invoke_r(cmd, log_path, n_samples, cohort_dir, analysis_name, append=False):
+def invoke_r(cmd, log_path, shared_dir, analysis_dir, analysis_name,
+             sample_ids, case_ids, append=False):
     """Run one attempt, streaming output to the log. Returns (rc, seconds)."""
     started = time.time()
     with open(log_path, "a" if append else "w") as log:
@@ -598,8 +1014,9 @@ def invoke_r(cmd, log_path, n_samples, cohort_dir, analysis_name, append=False):
         log.flush()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True,
-                                bufsize=1, cwd=cohort_dir)
-        stream_r_output(proc, log, n_samples, cohort_dir, analysis_name)
+                                bufsize=1, cwd=shared_dir)
+        stream_r_output(proc, log, shared_dir, analysis_dir, analysis_name,
+                        sample_ids, case_ids)
     return proc.returncode, time.time() - started
 
 
@@ -631,6 +1048,14 @@ def count_split_one(sample_id, anno_path, cohort_dir, analysis_name,
         result = subprocess.run(cmd, capture_output=True, text=True,
                                 timeout=timeout, cwd=scratch)
     except subprocess.TimeoutExpired:
+        # A timeout with the cache file already in place means the counting
+        # finished and the process failed to exit, which is not the same thing
+        # as the counting failing. Taking the result saves a recount that costs
+        # as long again as the wait that just expired.
+        if split_count_cache_file(cohort_dir, sample_id).exists():
+            log_path.write_text(f"timed out after {timeout}s, but the cache file "
+                                f"was already written; treated as done\n")
+            return sample_id, True, ""
         log_path.write_text(f"timed out after {timeout}s\n")
         return sample_id, False, f"timed out after {timeout / 3600:.1f}h"
 
@@ -643,7 +1068,7 @@ def count_split_one(sample_id, anno_path, cohort_dir, analysis_name,
 
 
 def count_split_reads_parallel(anno, anno_path, cohort_dir, analysis_name,
-                               max_workers=3, keep_scaffolds=False, timeout=6 * 3600):
+                               max_workers=3, keep_scaffolds=False, timeout = None):
     """
     Count split reads for every sample, one process each.
 
@@ -872,7 +1297,7 @@ def count_expression_one(sample_id, anno_path, saf_path, cache_dir, sample_dir,
 
 
 def count_expression_parallel(anno, anno_path, saf_path, cache_dir, root,
-                              max_workers, threads_each, timeout=4 * 3600):
+                              max_workers, threads_each, timeout = None):
     """
     Count genes for every sample, one process each.
 
@@ -1089,7 +1514,7 @@ def compute_mae(counts_path, sample_id, min_depth, ratio_thr, fdr_alpha):
 
 
 def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
-                min_baseq, ratio_thr, fdr_alpha, timeout):
+                min_baseq, ratio_thr, fdr_alpha, timeout, max_depth=10000):
     """
     Full ASE pipeline for one sample. Returns
     (sample_id, ok, detail, notes, n_sites, n_mae).
@@ -1097,7 +1522,7 @@ def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
     sample_id = str(row["sampleID"])
     bam, vcf = str(row["rna_path"]), str(row["vcf_path"])
     style = str(row.get("SeqLevelStyle", "UCSC"))
-    notes, log = [], []
+    notes = []
 
     sample_dir = Path(out_root) / sample_id
     tmp_dir = sample_dir / "_tmp"
@@ -1111,8 +1536,7 @@ def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
         return (sample_id, True, "", ["reused existing result"],
                 len(existing), int(existing["IS_MAE"].sum()))
 
-    def record(step, result):
-        log.append(f"$ {' '.join(step)}\n{result.stdout}{result.stderr}\n")
+    log = open(log_path, "w")
 
     try:
         tmp_dir.mkdir(parents=True, exist_ok=True)
@@ -1143,8 +1567,7 @@ def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
             genotyped = tmp_dir / "genotyped.vcf.gz"
             step = ["gatk", "GenotypeGVCFs", "-R", str(ref), "-V", str(vcf_in),
                     "-O", str(genotyped)]
-            result = run_cmd(step, timeout)
-            record(step, result)
+            result = run_cmd_streamed(step, log, timeout)
             if result.returncode != 0:
                 return (sample_id, False,
                         f"GenotypeGVCFs failed: {result.stderr.strip()[-200:]}",
@@ -1176,8 +1599,8 @@ def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
                 "--restrict-alleles-to", "BIALLELIC", "--exclude-filtered",
                 "-sn", vcf_sample,
                 "-select", f"vc.getGenotype('{vcf_sample}').isHet()"] + intervals
-        result = run_cmd(step, timeout)
-        record(step, result)
+        
+        result = run_cmd_streamed(step, log, timeout)
         if result.returncode != 0:
             return (sample_id, False,
                     f"SelectVariants failed: {result.stderr.strip()[-200:]}",
@@ -1185,12 +1608,14 @@ def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
 
         step = ["gatk", "ASEReadCounter", "-R", str(ref), "-I", bam,
                 "-V", str(het_vcf), "-O", str(counts_path),
+                "-L", str(het_vcf),
+                "--max-depth-per-sample", str(max_depth),
                 "--min-mapping-quality", str(min_mapq),
                 "--min-base-quality", str(min_baseq),
                 "--min-depth-of-non-filtered-base", str(min_depth),
                 "--output-format", "TABLE"]
-        result = run_cmd(step, timeout)
-        record(step, result)
+        
+        result = run_cmd_streamed(step, log, timeout)
         if result.returncode != 0:
             return (sample_id, False,
                     f"ASEReadCounter failed: {result.stderr.strip()[-200:]}",
@@ -1207,7 +1632,7 @@ def run_ase_one(row, out_root, fasta_references, overwrite, min_depth, min_mapq,
     except Exception as exc:
         return sample_id, False, str(exc), notes, 0, 0
     finally:
-        log_path.write_text("\n".join(log))
+        log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1273,14 +1698,18 @@ def prepare_ase(table):
     return table[[c for c in cols if c in table.columns]]
 
 
-def prepare_one(sample_id, sources, save_root, overwrite):
+def prepare_one(sample_id, sources, roots, overwrite):
     """
     Reshape whatever this sample has.
 
-    Returns (sample_id, written, absent, error). An analysis never run, or whose
-    output has since been removed, goes into `absent` rather than raising: a
-    patient with ASE but no splicing should still get their ASE through, and
-    filter_one already fills the missing side with NaN.
+    `roots` maps each kind to the directory its subfolder sits under: the
+    splicing and expression roots carry the analysis name, the ASE root does
+    not, because ASE depends on the patient alone.
+
+    `roots` is one directory per kind rather than one for all three, because
+    they are not all per-analysis: splicing and expression come from a cohort
+    fit and belong to the analysis that produced them, while ASE is the same
+    table whoever asked for it.
     """
     reshape = {"splicing": prepare_splicing, "expression": prepare_expression,
                "ase": prepare_ase}
@@ -1291,7 +1720,7 @@ def prepare_one(sample_id, sources, save_root, overwrite):
             if not src or not Path(src).exists():
                 absent.append(kind)
                 continue
-            out = save_root / kinds[kind][1] / f"{sample_id}.feather"
+            out = roots[kind] / kinds[kind][1] / f"{sample_id}.feather"
             if out.exists() and not overwrite:
                 written[kind] = out
                 continue

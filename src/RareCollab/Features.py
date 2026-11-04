@@ -603,7 +603,12 @@ def ENSURE_VCF_NON_EMPTY(vcf_path, sample_id, work_dir, overwrite=False):
 
     return vcf_path
 
-def ProcessVCF(samplesheet, max_workers, work_dir, references, fasta_references, overwrite=False, keep_intermediate=True):
+def ProcessVCF(samplesheet, work_dir, references, fasta_references, config=None, max_workers=None, overwrite=False, keep_intermediate=True):
+    # Rebound onto the parameter name, so the eight pools below read unchanged.
+    cfg = config or {}
+    max_workers = (max_workers or cfg.get("vcf_workers")
+                   or cfg.get("split_workers") or 1)
+
     #1.Make sure vcf is BGZIP and has .tbi
     print('1/8. Checking and Converting files into BGZIP ...')
     tasks = []
@@ -1589,8 +1594,10 @@ def GenerateFeatures(samplesheet, work_dir, references,
 # ===========================================================================
 
 
-def ProcessBAM(samplesheet, work_path, rna_background=None, overwrite=False,
+def ProcessBAM(samplesheet, work_path, rna_background=None,
+               fasta_references=None, overwrite=False,
                max_workers=None, threads_per_sample=None,
+               normalise_workers=None,
                max_reads=200000, target_informative=2000):
     """
     Index every RNA BAM in the cohort and resolve its library layout.
@@ -1607,10 +1614,19 @@ def ProcessBAM(samplesheet, work_path, rna_background=None, overwrite=False,
         samplesheet: DataFrame from Setup.LoadSamplesheet.
         work_path: root work directory.
         rna_background: optional DataFrame from Setup.LoadRNABackground.
+        fasta_references: object from Setup.BuildReferenceIndex. Given one,
+            every case BAM is checked against the reference and rewritten when
+            its contigs disagree, which is what the GATK steps downstream
+            need; background controls are left alone, being read only by
+            FRASER and OUTRIDER. Omitted, the pass is skipped entirely and
+            this behaves as before.
         overwrite: re-run detection even when a cached result is valid.
         max_workers, threads_per_sample: parallelism; derived from the core
             count and cohort size when None.
         max_reads: alignments sampled per BAM, split across regions.
+        normalise_workers: samples rewritten at once. Separate from max_workers
+            because rewriting a BAM is bound by storage bandwidth rather than
+            by cores. Derived from the core count when None.
         target_informative: spliced XS-tagged reads to aim for before stopping.
 
     Returns:
@@ -1618,10 +1634,20 @@ def ProcessBAM(samplesheet, work_path, rna_background=None, overwrite=False,
         'pairedEnd', 'SeqLevelStyle', 'sample_type']. vcf_path is carried
         through so RunASE has everything it needs from this one table; controls
         hold an empty string. Empty DataFrame if no sample has RNA.
+        rna_path points at the normalised copy for any sample that needed one,
+        so later steps read the right file without knowing this happened.
     """
     if shutil.which("samtools") is None:
         raise RuntimeError("samtools was not found on PATH. Run "
                            "Setup.CheckRequiredTools() for instructions.")
+    # Checked here rather than when the normalisation pass starts: that is at
+    # the far end of processing every BAM in the cohort, and a missing tool
+    # should not cost an hour to discover.
+    if fasta_references is not None and shutil.which("gatk") is None:
+        raise RuntimeError("gatk was not found on PATH, but fasta_references "
+                           "was given for contig normalisation. Run "
+                           "Setup.CheckRequiredTools(need_rna=True) for "
+                           "instructions, or omit fasta_references to skip it.")
 
     out_root = Path(work_path) / "BAMInfo"
     out_root.mkdir(parents=True, exist_ok=True)
@@ -1769,12 +1795,33 @@ def ProcessBAM(samplesheet, work_path, rna_background=None, overwrite=False,
               f"{missing_vcf}\n  RunASE needs the patient's own heterozygous "
               f"sites and will skip them; FRASER and OUTRIDER are unaffected.")
 
-    return result[["sampleID", "rna_path", "vcf_path", "strand", "pairedEnd",
-                   "SeqLevelStyle", "sample_type"]].reset_index(drop=True)
+    result = result[["sampleID", "rna_path", "vcf_path", "strand", "pairedEnd",
+                     "SeqLevelStyle", "sample_type"]].reset_index(drop=True)
+
+    # Normalisation runs after detection, not before. strand and pairedEnd are
+    # read from the alignments and are unaffected by which contigs survive,
+    # while choosing the target dictionary needs the SeqLevelStyle that
+    # detection produces.
+    if fasta_references is not None:
+        # Cases only. This exists for GATK's benefit, and RunASE is the one
+        # GATK step that reads an RNA BAM. FRASER reaches its BAMs through
+        # htslib random access and OUTRIDER through Rsubread; neither cares
+        # about contig order, and both already drop non-standard contigs
+        # themselves. Rewriting the background would duplicate hundreds of
+        # gigabytes to no purpose.
+        cases = result.loc[result["sample_type"] == "case"]
+        paths = _rna.normalise_bams_parallel(cases, out_root, fasta_references,
+                                             overwrite=overwrite,
+                                             max_workers=normalise_workers)
+        result["rna_path"] = (result["sampleID"].astype(str).map(paths)
+                              .fillna(result["rna_path"]))
+
+    return result
 
 
 def RunFRASER(rna_cohort, work_path, references, overwrite=False,
-              n_threads=None, max_attempts=6):
+              n_threads=None, max_attempts=6, analysis_name="my_work",
+              count_workers=None, fit_threads=None):
     """
     Run FRASER 2.0 across the whole RNA cohort, writing one table per case.
 
@@ -1783,9 +1830,12 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
     peak of every sample it has touched. Everything after runs in one process
     with counting serialised, so peak memory stays at a single sample's worth.
 
-        FraserRes/_cohort/     sample_anno.tsv, run_fraser.R, fraser.log, logs/,
-                               cache/, savedObjects/, fraser_results.tsv
-        FraserRes/<sampleID>/  junctions.feather, one per case
+        FraserRes/_cohort/                  cache/, savedObjects/, logs/
+        FraserRes/<analysis_name>/_cohort/  sample_anno.tsv, run_fraser.R,
+                                            cohort_roster.json, fraser.log,
+                                            fraser_results.tsv
+        FraserRes/<analysis_name>/<id>/     junctions.feather, one per case
+    The shared folder holds FRASER's count cache and is meant to be reused
 
     The cohort folder holds FRASER's count cache and is meant to be reused
     across batches: split-read counts are a property of one BAM alone, so a
@@ -1801,20 +1851,31 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
         work_path: root work directory.
         references: object from Setup.ResolveReferenceInputs.
         overwrite: re-run even when finished results are present.
-        n_threads: parallel counting processes, and cores for the fit. Derived
-            from available memory and the largest BAM when None.
+        n_threads: sets both numbers below at once, for callers written before
+            they were separate. A value given here is a starting point, not a
+            ceiling: both stages halve their own concurrency and retry rather
+            than failing at the number asked for.
+        count_workers: split-counting processes at a time. Memory-bound - each
+            holds roughly 2.5x the largest BAM - so this is the number that has
+            to be sized against the machine. Derived from MemAvailable and the
+            largest BAM when None.
+        fit_threads: cores for the model fit and for non-split counting.
+            CPU-bound and memory-cheap, so it wants cores and nothing else, and
+            has no reason to be throttled by the counting budget. Derived from
+            the core count when None.
         max_attempts: retries for the second stage before giving up.
+        analysis_name: names this analysis's results and cohort-level state. It
+            keys storage only and has no effect on the numbers - the same inputs
+            give the same results under any name. Two analyses of one work
+            directory under different names therefore keep separate outputs
+            while still sharing the expensive per-sample split counts.
 
     Returns:
         rna_cohort with a 'fraser_path' column. Cohort-level outputs are not in
-        the table because they are not per-sample: fraser_results.tsv and
-        savedObjects/*/fds-object.RDS live under FraserRes/_cohort/.
+        the table because they are not per-sample: fraser_results.tsv lives
+        under FraserRes/<analysis_name>/_cohort/, and the fitted object under
+        FraserRes/_cohort/savedObjects/<analysis_name>/fds-object.RDS.
     """
-    # Namespace for the cohort-level cache and saved objects. Not a parameter:
-    # it keys storage only and has no effect on the numbers, and nothing that
-    # would make two analyses genuinely different is exposed yet.
-    analysis_name = "my_work"
-
     if rna_cohort is None:
         print("RNA cohort is empty; skipping FRASER.")
         return pd.DataFrame(columns=["sampleID", "rna_path", "strand", "pairedEnd",
@@ -1829,78 +1890,95 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
     r_script = _rna.rscript_path("run_fraser.R")
 
     fraser_root = Path(work_path) / "FraserRes"
-    cohort_dir = fraser_root / "_cohort"
-    cohort_dir.mkdir(parents=True, exist_ok=True)
-    results_tsv = cohort_dir / "fraser_results.tsv"
+    shared_dir, analysis_dir, out_dir = _rna.analysis_layout(fraser_root, analysis_name)
+    results_tsv = out_dir / "fraser_results.tsv"
 
     print("Preparing the FRASER cohort ...")
     anno, cohort = _rna.prepare_fraser_cohort(rna_cohort)
     case_ids = cohort.loc[cohort["sample_type"] == "case", "sampleID"].astype(str).tolist()
 
+    # The roster is compared before the early exit rather than after it. A
+    # cohort whose membership changed has stale cohort-dependent state even
+    # when every case already has a junctions.feather, and returning those
+    # would hand back numbers fitted against a different background without
+    # saying so.
+    roster = sorted(anno["sampleID"])
+    roster_file = out_dir / "cohort_roster.json"
+    previous = json.loads(roster_file.read_text()) if roster_file.exists() else None
+    membership_changed = previous is not None and previous != roster
+
     # `case_ids and` matters: all([]) is True, so a cohort with no cases would
     # otherwise report itself finished.
-    expected = [fraser_root / sid / "junctions.feather" for sid in case_ids]
-    if case_ids and all(p.exists() for p in expected) and not overwrite:
+    expected = [analysis_dir / sid / "junctions.feather" for sid in case_ids]
+    if (case_ids and all(p.exists() for p in expected)
+            and not overwrite and not membership_changed):
         print(f"FRASER results already present for all {len(case_ids)} case(s).\n"
               f"  Pass overwrite=True to re-run.")
         return _rna.attach_output_column(rna_cohort, "fraser_path",
                                          dict(zip(case_ids, expected)))
 
-    anno_path = cohort_dir / "sample_anno.tsv"
+    anno_path = out_dir / "sample_anno.tsv"
     anno.to_csv(anno_path, sep="\t", index=False)
 
     # filterExpressionAndVariability stores its result under savedObjects and,
     # on a later run, rbinds the stored object onto the new one. That rbind
     # needs matching columns, so any membership change makes it fail with an
     # opaque .rbind.SummarizedExperiment error. Both count caches go too, being
-    # keyed to a splice-site set derived from the whole cohort. Per-sample split
-    # counts are membership-independent and stay - they are the expensive ones.
-    roster = sorted(anno["sampleID"])
-    roster_file = cohort_dir / "cohort_roster.json"
-    previous = json.loads(roster_file.read_text()) if roster_file.exists() else None
-    if previous is not None and previous != roster:
+    # keyed to a splice-site set derived from the whole cohort. Only this
+    # analysis's partition of each is cleared; another name's state is its own
+    # business. Per-sample split counts are membership-independent and shared,
+    # and stay - they are the expensive ones.
+    if membership_changed:
         print(f"  cohort membership changed "
               f"(+{len(set(roster) - set(previous))} / "
               f"-{len(set(previous) - set(roster))}); clearing cohort-dependent state")
         for stale in ("savedObjects", "cache/nonSplicedCounts", "cache/otherCounts"):
-            shutil.rmtree(cohort_dir / stale, ignore_errors=True)
+            shutil.rmtree(shared_dir / stale / analysis_name, ignore_errors=True)
     roster_file.write_text(json.dumps(roster, indent=2))
 
+    # Derived from the GENCODE annotation alone, so it is shared: a second
+    # analysis in the same work directory has no reason to rebuild it.
     gene_ranges = Path(references.rarecollab.gene_ranges)
     if not gene_ranges.exists():
         print(f"  {gene_ranges.name} not in the reference bundle; generating it")
-        gene_ranges = _rna.write_gene_ranges(references.rarecollab.gencode_annot,
-                                            cohort_dir / "gene_ranges.tsv")
+        gene_ranges = _rna.write_gene_ranges(references.rarecollab.gencode_annot, shared_dir / "gene_ranges.tsv")
 
-    shutil.copy2(r_script, cohort_dir / "run_fraser.R")
+    shutil.copy2(r_script, out_dir / "run_fraser.R")
 
-    if n_threads is None:
-        # Peak RSS per counting process tracks the largest BAM, not the mean:
-        # one unlucky batch of big samples is what kills a run. Measured at
-        # roughly 2.5x the on-disk size.
-        n_threads = max(1, min(_get_available_cpus(), 8))
-        try:
-            largest = max(Path(p).stat().st_size for p in cohort["rna_path"])
-            with open("/proc/meminfo") as fh:
-                for line in fh:
-                    if line.startswith("MemAvailable:"):
-                        avail = int(line.split()[1]) * 1024
-                        n_threads = max(1, min(n_threads,
-                                               int(avail * 0.7 // (largest * 2.5))))
-                        break
-        except (OSError, ValueError):
-            pass
+    # Two numbers because the two stages are bound by different things.
+    # Counting is memory-bound and the budget has to be sized against the
+    # largest BAM; the fit is CPU-bound and memory-cheap and has no business
+    # being throttled by that budget. n_threads sets both when given, which is
+    # what callers written before the split expect.
+    if count_workers is None:
+        count_workers = (n_threads if n_threads is not None
+                         else _rna.memory_safe_workers(cohort["rna_path"]))
+    if fit_threads is None:
+        fit_threads = (n_threads if n_threads is not None
+                       else max(1, min(_get_available_cpus(), 8)))
 
     n_case = len(case_ids)
     print(f"Running FRASER on {len(cohort)} sample(s) ({n_case} case, "
-          f"{len(cohort) - n_case} background), {n_threads} process(es)/thread(s).\n"
-          f"  Live log: {cohort_dir / 'fraser.log'}")
+          f"{len(cohort) - n_case} background).\n"
+          f"  counting: {count_workers} process(es), fit: {fit_threads} thread(s)\n"
+          f"  Live log: {out_dir / 'fraser.log'}")
 
     # ---- stage 1: split reads, isolated per sample ----
-    failures = _rna.count_split_reads_parallel(anno, anno_path, cohort_dir,
-                                               analysis_name,
-                                               max_workers=n_threads,
-                                               keep_scaffolds=False)
+    schedule = [count_workers]
+    while schedule[-1] > 1:
+        schedule.append(max(1, schedule[-1] // 2))
+
+    for workers in schedule:
+        failures = _rna.count_split_reads_parallel(anno, anno_path, shared_dir,
+                                                   analysis_name,
+                                                   max_workers=workers,
+                                                   keep_scaffolds=False)
+        if not failures:
+            break
+        if workers > 1:
+            print(f"  {len(failures)} sample(s) failed at {workers} process(es); "
+                  f"retrying them at {max(1, workers // 2)}")
+
     if failures:
         failed = {s for s, _ in failures}
         failed_cases = sorted(failed & set(case_ids))
@@ -1909,7 +1987,7 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
             raise RuntimeError(f"Split-read counting failed for case sample(s) "
                                f"{failed_cases}, so they would have no RNA "
                                f"evidence:\n{detail}\n"
-                               f"  Per-sample logs: {cohort_dir / 'logs'}")
+                               f"  Per-sample logs: {shared_dir / 'logs'}")
         print(f"  dropping {len(failed)} control(s) that could not be counted: "
               f"{sorted(failed)}")
         anno = anno.loc[~anno["sampleID"].isin(failed)].reset_index(drop=True)
@@ -1927,26 +2005,36 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
     # evidently workable, so it repeats; only a run that achieves nothing
     # justifies backing off. An input that fails regardless then shows up within
     # two attempts instead of after hours of stepping down.
-    log_path = cohort_dir / "fraser.log"
-    threads, attempt, total_elapsed, rc = n_threads, 0, 0.0, 1
+    log_path = out_dir / "fraser.log"
+    threads, attempt, total_elapsed, rc = fit_threads, 0, 0.0, 1
+
+    # Progress is measured against the samples this stage will actually handle.
+    # Taken from anno rather than the roster computed earlier, because the
+    # control-drop path above may have trimmed it.
+    counted_ids = anno["sampleID"].astype(str).tolist()
+    n_steps = len(counted_ids) + len(case_ids)
 
     while attempt < max_attempts:
         attempt += 1
-        before = _rna.count_cached_samples(cohort_dir, analysis_name)
+        before = _rna.count_cached_samples(shared_dir, analysis_dir,
+                                           analysis_name, counted_ids, case_ids)
+        # working_dir is the shared folder, out_dir this analysis's; the script
+        # writes per-sample tables to dirname(out_dir)/<sampleID>.
         cmd = ["Rscript", "--vanilla", str(r_script), str(anno_path),
-               str(gene_ranges), str(cohort_dir), str(cohort_dir),
+               str(gene_ranges), str(shared_dir), str(out_dir),
                str(threads), analysis_name]
         if attempt > 1:
             print(f"\nAttempt {attempt}/{max_attempts} with {threads} thread(s) "
-                  f"({before}/{2 * len(cohort)} sample-phases cached)")
+                  f"({before}/{n_steps} sample-step(s) done)")
 
-        rc, elapsed = _rna.invoke_r(cmd, log_path, len(cohort), cohort_dir,
-                                    analysis_name, append=(attempt > 1))
+        rc, elapsed = _rna.invoke_r(cmd, log_path, shared_dir, analysis_dir,
+                                    analysis_name, counted_ids, case_ids,
+                                    append=(attempt > 1))
         total_elapsed += elapsed
         if rc == 0:
             break
 
-        gained = _rna.count_cached_samples(cohort_dir, analysis_name) - before
+        gained = _rna.count_cached_samples(shared_dir, analysis_dir, analysis_name, counted_ids, case_ids) - before
         if gained > 0:
             print(f"  attempt {attempt} failed after {elapsed/60:.1f} min but "
                   f"completed {gained} more sample-phase(s); retrying at "
@@ -1971,11 +2059,11 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
     # dependency and costs one sample's memory at a time.
     produced = {}
     for sid in case_ids:
-        src = fraser_root / sid / "junctions.tsv.gz"
+        src = analysis_dir / sid / "junctions.tsv.gz"
         if not src.exists():
             print(f"  WARNING: no junction table produced for {sid}")
             continue
-        out = fraser_root / sid / "junctions.feather"
+        out = analysis_dir / sid / "junctions.feather"
         pd.read_csv(src, sep="\t").to_feather(out)
         src.unlink()
         produced[sid] = out
@@ -1986,14 +2074,14 @@ def RunFRASER(rna_cohort, work_path, references, overwrite=False,
 
     n_sig = max(0, sum(1 for _ in open(results_tsv)) - 1) if results_tsv.exists() else 0
     print(f"\nFRASER finished in {total_elapsed/60:.1f} min.\n"
-          f"  {len(produced)} case sample(s) written under {fraser_root}\n"
+          f"  {len(produced)} case sample(s) written under {analysis_dir}\n"
           f"  {n_sig} significant event(s) at padj<=0.1, |deltaJaccard|>=0.1\n"
-          f"  cohort-level tables under {cohort_dir}")
+          f"  cohort-level tables under {out_dir}")
     return _rna.attach_output_column(rna_cohort, "fraser_path", produced)
 
 
 def RunOutrider(rna_cohort, work_path, references, overwrite=False,
-                n_threads=None, fpkm_cutoff=1.0):
+                n_threads=None, fpkm_cutoff=1.0, analysis_name="my_work"):
     """
     Run OUTRIDER across the RNA cohort, writing one table per case.
 
@@ -2001,9 +2089,12 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
     looks like across samples, so a lone sample has nothing to be an outlier
     against. Cases and controls are fitted together and sliced afterwards.
 
-        OutriderRes/_cohort/     sample_anno.tsv, gene_annotation.saf,
-                                 outrider.log, logs/, cache/, ods-object.RDS
-        OutriderRes/<sampleID>/  expression.feather, one per case
+        OutriderRes/_cohort/                  cache/geneCounts/, logs/,
+                                              gene_annotation.saf
+        OutriderRes/<analysis_name>/_cohort/  sample_anno.tsv, run_outrider.R,
+                                              cohort_roster.json, outrider.log,
+                                              ods-object.RDS
+        OutriderRes/<analysis_name>/<id>/     expression.feather, one per case
 
     Counting is far cheaper than FRASER's: featureCounts streams the BAM in C
     instead of materialising alignments as R objects, so memory stays flat and
@@ -2023,6 +2114,10 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
             threads each. Derived from the core count when None.
         fpkm_cutoff: genes whose 95th percentile across samples falls below this
             are dropped before fitting. 1.0 is the OUTRIDER default.
+        analysis_name: names this analysis's results and cohort-level state. It
+            keys storage only and has no effect on the numbers. Gene counts stay
+            shared across names, depending as they do on the BAM and the
+            annotation alone.
 
     Returns:
         rna_cohort with an 'outrider_path' column, holding every gene that
@@ -2043,9 +2138,11 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
     r_script = _rna.rscript_path("run_outrider.R")
 
     root = Path(work_path) / "OutriderRes"
-    cohort_dir = root / "_cohort"
-    cache_dir = cohort_dir / "cache" / "geneCounts"
-    cohort_dir.mkdir(parents=True, exist_ok=True)
+    shared_dir, analysis_dir, out_dir = _rna.analysis_layout(root, analysis_name)
+    # Gene counts depend on the BAM and the annotation only, never on cohort
+    # membership or on which analysis asked for them, so the cache and the SAF
+    # that keys it are shared across analysis names.
+    cache_dir = shared_dir / "cache" / "geneCounts"
 
     # OUTRIDER has no equivalent of FRASER's refusal to mix stranded with
     # unstranded: featureCounts applies strandSpecific per sample, so a mixed
@@ -2081,26 +2178,40 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
               f"the very effect being looked for, since the model learns the "
               f"shared variant as normal.")
 
-    expected = [root / sid / "expression.feather" for sid in case_ids]
-    if all(p.exists() for p in expected) and not overwrite:
+    # Compared before the early exit, not after: the fit is over the whole
+    # cohort, so a membership change makes every stored table a description of
+    # a background that no longer exists. Nothing needs clearing - the gene
+    # count cache is membership-independent and the model is refitted from
+    # scratch - but the results do need regenerating.
+    roster = sorted(cohort["sampleID"].astype(str))
+    roster_file = out_dir / "cohort_roster.json"
+    previous = json.loads(roster_file.read_text()) if roster_file.exists() else None
+    membership_changed = previous is not None and previous != roster
+    if membership_changed:
+        print(f"  cohort membership changed "
+              f"(+{len(set(roster) - set(previous))} / "
+              f"-{len(set(previous) - set(roster))}); refitting")
+
+    expected = [analysis_dir / sid / "expression.feather" for sid in case_ids]
+    if (case_ids and all(p.exists() for p in expected)
+            and not overwrite and not membership_changed):
         print(f"OUTRIDER results already present for all {len(case_ids)} case(s).\n"
               f"  Pass overwrite=True to re-run.")
         return _rna.attach_output_column(rna_cohort, "outrider_path",
                                          dict(zip(case_ids, expected)))
 
     anno = _rna.build_fraser_anno(cohort, with_seqlevelstyle=False)
-    anno_path = cohort_dir / "sample_anno.tsv"
+    anno_path = out_dir / "sample_anno.tsv"
     anno.to_csv(anno_path, sep="\t", index=False)
+    roster_file.write_text(json.dumps(roster, indent=2))
 
-    gene_ranges = Path(references.rarecollab.gene_ranges)
-    if not gene_ranges.exists():
-        gene_ranges = _rna.write_gene_ranges(references.rarecollab.gencode_annot,
-                                             cohort_dir / "gene_ranges.tsv")
+    gene_ranges = _rna.write_gene_ranges(references.rarecollab.gencode_annot,
+                                             shared_dir / "gene_ranges.tsv")
     saf_path, n_genes = _rna.write_gene_saf(gene_ranges,
-                                            cohort_dir / "gene_annotation.saf")
+                                            shared_dir / "gene_annotation.saf")
     print(f"Annotation: {n_genes} gene(s) -> {saf_path.name}")
 
-    shutil.copy2(r_script, cohort_dir / "run_outrider.R")
+    shutil.copy2(r_script, out_dir / "run_outrider.R")
 
     if n_threads is None:
         n_threads = max(1, min(_get_available_cpus(), 16))
@@ -2111,10 +2222,10 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
     threads_each = max(1, n_threads // max_workers)
 
     print(f"Running OUTRIDER on {len(cohort)} sample(s) ({len(case_ids)} case, "
-          f"{n_control} background).\n  Live log: {cohort_dir / 'outrider.log'}")
+          f"{n_control} background).\n  Live log: {out_dir / 'outrider.log'}")
 
     failures = _rna.count_expression_parallel(anno, anno_path, saf_path, cache_dir,
-                                              root, max_workers, threads_each)
+                                              analysis_dir, max_workers, threads_each)
     if failures:
         failed = {s for s, _ in failures}
         failed_cases = sorted(failed & set(case_ids))
@@ -2122,22 +2233,25 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
             detail = "\n".join(f"  {s}: {d}" for s, d in failures)
             raise RuntimeError(f"Gene counting failed for case sample(s) "
                                f"{failed_cases}:\n{detail}\n"
-                               f"  Per-sample logs: {cohort_dir / 'logs'}")
+                               f"  Per-sample logs: {shared_dir / 'logs'}")
         print(f"  dropping {len(failed)} control(s) that could not be counted: "
               f"{sorted(failed)}")
         anno = anno.loc[~anno["sampleID"].isin(failed)].reset_index(drop=True)
         cohort = cohort.loc[~cohort["sampleID"].isin(failed)].reset_index(drop=True)
         anno.to_csv(anno_path, sep="\t", index=False)
+        # Keep the roster in step, or the next run sees a phantom membership
+        # change and refits for nothing.
+        roster_file.write_text(json.dumps(sorted(anno["sampleID"]), indent=2))
 
-    log_path = cohort_dir / "outrider.log"
+    log_path = out_dir / "outrider.log"
     cmd = ["Rscript", "--vanilla", str(r_script), str(anno_path), str(cache_dir),
-           str(cohort_dir), str(n_threads), str(fpkm_cutoff)]
+           str(out_dir), str(n_threads), str(fpkm_cutoff)]
     started = time.time()
     with open(log_path, "w") as log:
         log.write(" ".join(cmd) + "\n\n")
         log.flush()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, cwd=cohort_dir)
+                                text=True, bufsize=1, cwd=out_dir)
         for line in proc.stdout:
             log.write(line)
             log.flush()
@@ -2156,11 +2270,11 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
 
     produced = {}
     for sid in case_ids:
-        src = root / sid / "expression.tsv.gz"
+        src = analysis_dir / sid / "expression.tsv.gz"
         if not src.exists():
             print(f"  WARNING: no expression table produced for {sid}")
             continue
-        out = root / sid / "expression.feather"
+        out = analysis_dir / sid / "expression.feather"
         pd.read_csv(src, sep="\t").to_feather(out)
         src.unlink()
         produced[sid] = out
@@ -2170,13 +2284,69 @@ def RunOutrider(rna_cohort, work_path, references, overwrite=False,
                            f"See {log_path}.")
 
     print(f"\nOUTRIDER finished in {elapsed/60:.1f} min.\n"
-          f"  {len(produced)} case sample(s) written under {root}")
+          f"  {len(produced)} case sample(s) written under {analysis_dir}")
     return _rna.attach_output_column(rna_cohort, "outrider_path", produced)
 
+def CollectRNACases(*rna_tables):
+    """
+    One case list from any number of ProcessBAM outputs.
 
-def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
-           max_workers=None, min_depth=10, min_mapq=10, min_baseq=10,
-           ratio_thr=0.10, fdr_alpha=0.05, timeout=4 * 3600):
+    ASE is not a cohort method: it compares two alleles inside one sample, so
+    who else is in the run changes nothing about the answer. Background
+    controls are therefore irrelevant to it, and cases from unrelated cohorts
+    are safe to run together - which is the point of this. FRASER and OUTRIDER
+    cannot be combined this way; their models are fitted across whichever
+    samples they are given.
+
+    Control rows are dropped, and so are cases with no vcf_path: heterozygous
+    sites come from the patient's own DNA, so a sample without one has nothing
+    to measure. A sampleID appearing in more than one table is kept once. If
+    its rows disagree on which files to use the first wins and the clash is
+    reported, because quietly preferring one BAM over another is how a patient
+    ends up holding another patient's result.
+
+    Returns a DataFrame with the columns RunASE reads: sampleID, rna_path,
+    vcf_path and SeqLevelStyle.
+    """
+    keep = ["sampleID", "rna_path", "vcf_path", "SeqLevelStyle"]
+    frames = [t for t in rna_tables if t is not None and not t.empty]
+    if not frames:
+        print("No RNA table given; nothing to collect.")
+        return pd.DataFrame(columns=keep)
+
+    combined = pd.concat(frames, ignore_index=True)
+    if "sample_type" in combined.columns:
+        combined = combined.loc[combined["sample_type"] == "case"]
+
+    combined["sampleID"] = combined["sampleID"].astype(str)
+    for column in ("vcf_path", "SeqLevelStyle"):
+        if column not in combined.columns:
+            combined[column] = ""
+    combined["vcf_path"] = combined["vcf_path"].fillna("").astype(str)
+
+    no_vcf = sorted(set(combined.loc[combined["vcf_path"].str.strip() == "",
+                                     "sampleID"]))
+    if no_vcf:
+        print(f"  dropping {len(no_vcf)} case(s) with no vcf_path: {no_vcf}")
+        combined = combined.loc[combined["vcf_path"].str.strip() != ""]
+
+    combined = combined[keep].reset_index(drop=True)
+    conflicts = sorted(sid for sid, rows in combined.groupby("sampleID")
+                       if len(rows[["rna_path", "vcf_path"]].drop_duplicates()) > 1)
+    if conflicts:
+        print(f"  WARNING: {len(conflicts)} sampleID(s) appear with different "
+              f"files in different tables; the first occurrence wins: {conflicts}")
+
+    deduped = combined.drop_duplicates("sampleID", keep="first").reset_index(drop=True)
+    if len(deduped) < len(combined):
+        print(f"  {len(combined) - len(deduped)} duplicate row(s) collapsed by sampleID")
+
+    print(f"Collected {len(deduped)} case sample(s) for ASE.")
+    return deduped
+
+def RunASE(rna_samples, work_path, fasta_references, overwrite=False,
+           max_workers=None, min_depth=10, max_depth=10000, min_mapq=10,
+           min_baseq=10, ratio_thr=0.10, fdr_alpha=0.05, timeout=None):
     """
     Count reads per allele at each patient's heterozygous sites, and flag
     mono-allelic expression.
@@ -2196,12 +2366,20 @@ def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
     the sample's work folder. The BAM is never touched.
 
     Args:
-        rna_cohort: DataFrame from ProcessBAM or an earlier RNA step.
+        rna_samples: the samples to run on. A ProcessBAM cohort works - the
+            case rows are taken and controls ignored - and so does a plain case
+            list from CollectRNACases, which is how cases from several cohorts
+            are run together. Needs sampleID, rna_path, vcf_path and
+            SeqLevelStyle.
         work_path: root work directory.
         fasta_references: object from Setup.BuildReferenceIndex.
         overwrite: re-run even where a result already exists.
         max_workers: samples at once. Derived from cores when None.
         min_depth: reads required at a site for it to be reported.
+        max_depth: reads GATK looks at before downsampling at one site. RNA-seq
+            coverage is wildly uneven and a handful of loci carry millions of
+            reads; the ratio from ten thousand is already exact, and without a
+            cap one such site can hold the run for hours.
         min_mapq, min_baseq: GATK read and base quality floors.
         ratio_thr: how extreme an allelic ratio must be, at either end, to be a
             candidate for the MAE flag.
@@ -2209,17 +2387,17 @@ def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
         timeout: per-GATK-step ceiling, in seconds.
 
     Returns:
-        rna_cohort with an 'ase_path' column, holding every site
+        the input table with an 'ase_path' column, holding every site
         ASEReadCounter reported, with IS_MAE as one column rather than a filter.
     """
-    if rna_cohort is None:
-        print("RNA cohort is empty; skipping ASE.")
+    if rna_samples is None:
+        print("No RNA samples given; skipping ASE.")
         return pd.DataFrame(columns=["sampleID", "rna_path", "vcf_path", "strand",
                                      "pairedEnd", "SeqLevelStyle", "sample_type",
                                      "ase_path"])
-    if rna_cohort.empty:
-        print("RNA cohort is empty; skipping ASE.")
-        return _rna.attach_output_column(rna_cohort, "ase_path", {})
+    if rna_samples.empty:
+        print("No RNA samples given; skipping ASE.")
+        return _rna.attach_output_column(rna_samples, "ase_path", {})
 
     for tool in ("gatk", "bcftools"):
         if shutil.which(tool) is None:
@@ -2233,8 +2411,11 @@ def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
     out_root.mkdir(parents=True, exist_ok=True)
 
     # Only cases, and only those with a VCF: het sites come from the patient's
-    # own DNA, so a sample without one has nothing to measure.
-    cases = rna_cohort.loc[rna_cohort["sample_type"] == "case"].copy()
+    # own DNA, so a sample without one has nothing to measure. A table with no
+    # sample_type column is already a case list - CollectRNACases returns one -
+    # and every row of it is taken.
+    cases = (rna_samples.loc[rna_samples["sample_type"] == "case"].copy()
+             if "sample_type" in rna_samples.columns else rna_samples.copy())
     has_vcf = ~(cases["vcf_path"].isna()
                 | (cases["vcf_path"].astype(str).str.strip() == ""))
     skipped = cases.loc[~has_vcf, "sampleID"].tolist()
@@ -2244,7 +2425,7 @@ def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
         print(f"  skipping {len(skipped)} case(s) with no vcf_path: {skipped}")
     if cases.empty:
         print("No case sample has both RNA and a VCF; skipping ASE.")
-        return _rna.attach_output_column(rna_cohort, "ase_path", {})
+        return _rna.attach_output_column(rna_samples, "ase_path", {})
 
     if max_workers is None:
         # GATK runs on the JVM with a fixed heap and streams the BAM, so memory
@@ -2267,7 +2448,7 @@ def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
             futures = [pool.submit(_rna.run_ase_one, row, out_root, fasta_references,
                                    overwrite, min_depth, min_mapq, min_baseq,
-                                   ratio_thr, fdr_alpha, timeout)
+                                   ratio_thr, fdr_alpha, timeout, max_depth)
                        for _, row in cases.iterrows()]
             for future in as_completed(futures):
                 sid, ok, detail, sample_notes, n_sites, n_mae = future.result()
@@ -2303,18 +2484,67 @@ def RunASE(rna_cohort, work_path, fasta_references, overwrite=False,
           f"(range {min(sites):,}-{max(sites):,})\n"
           f"  MAE flagged:      median {int(np.median(maes))} "
           f"(range {min(maes)}-{max(maes)})")
-    return _rna.attach_output_column(rna_cohort, "ase_path", results)
+    return _rna.attach_output_column(rna_samples, "ase_path", results)
 
-
-def PrepareRNAEvidence(rna_cohort, samplesheet, work_path, overwrite=False,
-                       max_workers=None):
+def AttachASEPaths(rna_cohort, work_path):
     """
-    Reshape the RNA outputs for DiagnosticEngine and record them on the
-    samplesheet.
+    Put ase_path back on a cohort table after a combined ASE run.
 
-        Diagnostic_results/RNA_MoE/Splicing/<sampleID>.feather
-        Diagnostic_results/RNA_MoE/Expression/<sampleID>.feather
-        Diagnostic_results/RNA_MoE/ASE/<sampleID>.feather
+    RunASE returns whatever table it was handed, so a run over a
+    CollectRNACases list gives back that combined list rather than the cohorts
+    the samples came from. This reads the per-sample results already on disk
+    and attaches them to any table, which is what the rest of the pipeline
+    wants: PrepareRNAEvidence works one cohort at a time.
+
+    Lookup is by sampleID alone, with no record of which run produced what,
+    because an ASE result describes one sample and nothing else - the same
+    property that makes combining cohorts safe to begin with.
+
+    Args:
+        rna_cohort: any table with a sampleID column.
+        work_path: the work directory the ASE run wrote to.
+
+    Returns:
+        A copy with an 'ase_path' column. Samples with no result get an empty
+        string, as controls always will.
+    """
+    out_root = Path(work_path) / "ASERes"
+    found = {}
+    for sid in rna_cohort["sampleID"].astype(str):
+        path = out_root / sid / "ase.feather"
+        if path.exists():
+            found[sid] = path
+
+    # Controls never have a result, so only cases count as missing.
+    wanted = (rna_cohort.loc[rna_cohort["sample_type"] == "case", "sampleID"]
+              if "sample_type" in rna_cohort.columns else rna_cohort["sampleID"])
+    missing = sorted(set(wanted.astype(str)) - set(found))
+
+    print(f"Attached {len(found)} ASE result(s) from {out_root}.")
+    if missing:
+        print(f"  {len(missing)} case(s) have no result on disk: {missing}\n"
+              f"  They keep an empty ase_path; their other RNA evidence is "
+              f"unaffected.")
+
+    return _rna.attach_output_column(rna_cohort, "ase_path", found)
+
+def PrepareRNAEvidence(rna_cohort, samplesheet, work_path,
+                       analysis_name=_rna.DEFAULT_ANALYSIS,
+                       overwrite=False, max_workers=None):
+    """
+    Reshape one analysis's RNA outputs for DiagnosticEngine.
+
+        Diagnostic_results/RNA_MoE/Splicing/<sampleID>.feather        default
+        Diagnostic_results/RNA_MoE/Expression/<sampleID>.feather      default
+        Diagnostic_results/RNA_MoE/case_a/Splicing/<sampleID>.feather
+        Diagnostic_results/RNA_MoE/case_a/Expression/<sampleID>.feather
+        Diagnostic_results/RNA_MoE/ASE/<sampleID>.feather             always shared
+
+    FRASER and OUTRIDER measure a patient against a background cohort, so the
+    same patient run against two cohorts has two different answers and both
+    have to survive. ASE is a pileup over that patient's own reads; it has one
+    answer whichever cohort is alongside, so it stays outside the analysis
+    folder and is written once.
 
     Nothing is combined; each sample is handled on its own and peak memory is
     one sample's worth. The reshaped copies live apart from the analysis
@@ -2328,24 +2558,42 @@ def PrepareRNAEvidence(rna_cohort, samplesheet, work_path, overwrite=False,
     Args:
         rna_cohort: DataFrame carrying whichever of fraser_path, outrider_path
             and ase_path exist.
-        samplesheet: the DNA samplesheet to annotate.
+        samplesheet: the DNA samplesheet, used to look the cases up.
         work_path: root work directory.
+        analysis_name: the name this cohort was analysed under; must match the
+            one given to RunFRASER and RunOutrider.
         overwrite: rewrite files that are already there.
         max_workers: samples reshaped at once. Derived from cores when None.
 
     Returns:
-        samplesheet with rna_splicing_path, rna_expression_path and rna_ase_path
-        added, also written to <work_path>/samplesheet_with_paths.csv so a later
-        session can pick up without re-running anything.
+        only this analysis's case rows, each carrying an analysis_name column.
+        Pass the returned tables to MergeRNAEvidence to get one samplesheet
+        back; this function deliberately writes none, since each analysis
+        writing samplesheet_with_paths.csv would mean each overwriting the last.
     """
     kinds = _rna.rna_kinds()
-    save_root = Path(work_path) / "Diagnostic_results" / "RNA_MoE"
+    analysis_name = str(analysis_name or _rna.DEFAULT_ANALYSIS).strip()
+
+    # The analysis folder is a sibling of the per-kind folders, so a name that
+    # collides with one would scatter its results into the shared tree.
+    reserved = {sub for _, sub, _ in kinds.values()}
+    if analysis_name in reserved:
+        raise ValueError(f"analysis_name may not be one of {sorted(reserved)}")
+
+    base = Path(work_path) / "Diagnostic_results" / "RNA_MoE"
+    roots = {kind: (base if kind == "ase"
+                    else _rna.analysis_subdir(base, analysis_name))
+             for kind in kinds}
 
     def _blank(reason):
+        # Empty but correctly shaped: MergeRNAEvidence concatenates these, and
+        # returning the whole samplesheet would silently file every patient
+        # under this analysis.
         print(reason)
-        out = samplesheet.copy()
+        out = samplesheet.iloc[0:0].copy()
         for _, _, column in kinds.values():
             out[column] = ""
+        out["analysis_name"] = analysis_name
         return out
 
     if rna_cohort is None or rna_cohort.empty:
@@ -2379,7 +2627,7 @@ def PrepareRNAEvidence(rna_cohort, samplesheet, work_path, overwrite=False,
                bar_format="{desc:<38} {bar} {n_fmt}/{total_fmt} [{elapsed}]")
     try:
         with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(_rna.prepare_one, sid, sources, save_root, overwrite)
+            futures = [pool.submit(_rna.prepare_one, sid, sources, roots, overwrite)
                        for sid, sources in jobs.items()]
             for future in as_completed(futures):
                 sid, got, miss, error = future.result()
@@ -2404,17 +2652,74 @@ def PrepareRNAEvidence(rna_cohort, samplesheet, work_path, overwrite=False,
         print(f"\nWARNING: {len(failures)} sample(s) could not be reshaped; their "
               f"RNA evidence will be missing downstream.")
 
-    # Joined on sampleID rather than by position: the samplesheet holds every
-    # patient, including those with no RNA, and their columns must stay empty
-    # rather than pick up a neighbour's path.
-    out = samplesheet.copy()
+    # Only this analysis's cases come back, each stamped with the name it ran
+    # under. Joined on sampleID rather than by position, so a patient absent
+    # from one analysis cannot pick up a neighbour's path.
+    wanted = set(cases["sampleID"].astype(str))
+    out = samplesheet.loc[samplesheet["sampleID"].astype(str).isin(wanted)].copy()
     for kind, (_, _, column) in kinds.items():
         mapping = {k: str(v) for k, v in written[kind].items()}
         out[column] = out["sampleID"].astype(str).map(mapping).fillna("")
+    out["analysis_name"] = analysis_name
 
-    samplesheet_path = Path(work_path) / "samplesheet_with_paths.csv"
-    tmp = Path(work_path) / ".samplesheet_with_paths.csv.tmp"
-    out.to_csv(tmp, index=False)
-    os.replace(tmp, samplesheet_path)
-    print(f"Updated samplesheet: {samplesheet_path}")
+    stray = sorted(wanted - set(out["sampleID"].astype(str)))
+    if stray:
+        print(f"  NOTE: {len(stray)} RNA case(s) are not in the DNA samplesheet "
+              f"and were dropped: {', '.join(stray[:5])}"
+              + (" ..." if len(stray) > 5 else ""))
+    print(f"Prepared {len(out)} case row(s) under analysis_name={analysis_name!r}")
+    return out
+
+def MergeRNAEvidence(samplesheet, *evidence, work_path=None):
+    """
+    Assemble one long samplesheet out of the per-analysis tables.
+
+    One row per (patient, RNA analysis). A patient analysed against two
+    background cohorts gets two rows carrying two sets of RNA paths, so both
+    results survive side by side; a patient with no RNA keeps their single row
+    under the default analysis name. Every downstream step reads analysis_name
+    off the row rather than taking it as an argument, which is what lets the
+    whole cohort go through in one pass instead of once per analysis.
+
+    Background RNA samples cannot appear here: PrepareRNAEvidence returns only
+    rows that were already in the DNA samplesheet.
+
+    Args:
+        samplesheet: the full DNA samplesheet, one row per patient.
+        *evidence: the tables PrepareRNAEvidence returned, one per analysis.
+        work_path: where to write samplesheet_with_paths.csv. Skipped if None.
+
+    Returns:
+        the long samplesheet, sorted so a patient's rows sit together.
+    """
+    kinds = _rna.rna_kinds()
+    tables = [t for t in evidence if t is not None and not t.empty]
+
+    covered = set()
+    for table in tables:
+        covered |= set(table["sampleID"].astype(str))
+
+    rest = samplesheet.loc[
+        ~samplesheet["sampleID"].astype(str).isin(covered)].copy()
+    rest["analysis_name"] = _rna.DEFAULT_ANALYSIS
+    for _, _, column in kinds.values():
+        if column not in rest.columns:
+            rest[column] = ""
+
+    out = (pd.concat([rest, *tables], ignore_index=True)
+             .sort_values(["sampleID", "analysis_name"])
+             .reset_index(drop=True))
+
+    extra = len(out) - out["sampleID"].nunique()
+    print(f"Merged samplesheet: {len(out)} row(s) for "
+          f"{out['sampleID'].nunique()} patient(s)"
+          + (f"; {extra} extra row(s) from patients in more than one analysis"
+             if extra else ""))
+
+    if work_path is not None:
+        path = Path(work_path) / "samplesheet_with_paths.csv"
+        tmp = Path(work_path) / ".samplesheet_with_paths.csv.tmp"
+        out.to_csv(tmp, index=False)
+        os.replace(tmp, path)
+        print(f"Updated samplesheet: {path}")
     return out

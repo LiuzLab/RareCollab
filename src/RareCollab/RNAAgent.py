@@ -11,19 +11,17 @@ of the RNA evidence.
     Agents/RNA/GeneLevelEval/<sampleID>/<gene>.json
     Agents/RNA/VariantLevelEval/<sampleID>/<gene>_VarId_<varId>.json
 """
-
-import json
 import os
+import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-
-import numpy as np
-import pandas as pd
 import pysam
 import requests
+import numpy as np
+import pandas as pd
 from tqdm import tqdm
-
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ._lib._analysis import analysis_subdir, row_analysis
+from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Prompts
@@ -222,43 +220,206 @@ If you cannot comply, output exactly:{{"Reasoning":"comply_error","Event":"No Si
     return prompt
 
 
+class _PromptPlaceholders(dict):
+    """
+    A mapping whose every lookup yields a self-labelling placeholder.
+
+    __bool__ is pinned true because an empty dict is falsy, and a builder that
+    gates a section on `if ase_items:` would otherwise silently leave that
+    section out of what this prints - the one thing this function must not do.
+    """
+
+    def __missing__(self, key):
+        return f"<{key}>"
+
+    def __bool__(self):
+        return True
+
+
+_PROMPTS = ("gene", "variant")
+
+
+def ShowPrompt(which=None):
+    """
+    Print one of this agent's prompts, with the per-case parts marked.
+
+    Rendered by the real builders rather than from a copy of the text, so it
+    cannot drift. A stale copy would be worse than nothing: the only reason to
+    read this is to trust it.
+
+    Not configurable. The conclusion labels these prompts define are parsed
+    downstream and feed the Tier rules, so rewording them would quietly change
+    results rather than just change the wording.
+
+    The gene-constraint values are example numbers rather than placeholders,
+    because the builders parse them as floats; every field they only
+    interpolate is marked <like this>.
+    """
+    if which not in _PROMPTS:
+        if which is not None:
+            print(f"Unknown prompt: {which!r}\n")
+        print(f"RNAAgent sends {len(_PROMPTS)} prompts: "
+              f"{', '.join(repr(p) for p in _PROMPTS)}\n"
+              f"  ShowPrompt('{_PROMPTS[0]}')")
+        return
+
+    placeholders = _PromptPlaceholders()
+
+    constraints = {"gnomadGenePLI": 0.99,
+                   "gnomadGeneOELof": 0.08,
+                   "gnomadGeneOELofUpper": 0.21}
+
+    # Compared against 1 rather than interpolated, so placeholder strings would
+    # quietly render this line as "unknown" instead of showing its shape.
+    inheritance = {"recessive": 1, "dominant": 1}
+
+    # A string, not a list: _clingen_block returns pre-formatted text and the
+    # builders interpolate it whole. The parameter's `: list` annotation is
+    # stale.
+    clingen = ("\n- Haploinsufficiency: <HAPLOINSUFFICIENCY>"
+               "\n- Triplosensitivity: <TRIPLOSENSITIVITY>\n")
+
+    if which == "gene":
+        print(build_prompt_RNA_agent_gene(
+            gene="<GENE>",
+            fraser_pvalue_gene="<FRASER gene-level p-value>",
+            outrider_items=placeholders,
+            gene_constraints=constraints,
+            inheritance_flags=inheritance,
+            clingen_dosage=clingen,
+        ))
+    else:
+        print(build_prompt_RNA_agent_variant(
+            gene="<GENE>",
+            fraser_items=placeholders,
+            outrider_items=placeholders,
+            ase_items=placeholders,
+            gene_constraints=constraints,
+            inheritance_flags=inheritance,
+            clingen_dosage=clingen,
+        ))
 # ---------------------------------------------------------------------------
 # ClinVar burden
 # ---------------------------------------------------------------------------
+# Only unambiguous classifications are counted. The prompt tells the model
+# these are "counts of Pathogenic/Likely pathogenic vs Benign/Likely benign",
+# so folding anything else in would make that description false - and
+# Conflicting_classifications_of_pathogenicity means the submitters disagree,
+# which is precisely not a count of either.
+_PLP_TOKENS = frozenset({"Pathogenic", "Likely_pathogenic",
+                         "Pathogenic/Likely_pathogenic"})
+_BLB_TOKENS = frozenset({"Benign", "Likely_benign", "Benign/Likely_benign"})
 
-def clinvar_region_metrics(chrom: str, start: int, end: int, assembly: str, chrom_region_cache, NCBI_EMAIL, NCBI_KEY):
-    params = {"db": "clinvar",
-              "retmode": "json",
-              "tool": "rna_region_ratio"}
-    if NCBI_EMAIL:
-        params["email"] = NCBI_EMAIL
-    if NCBI_KEY:
-        params["api_key"] = NCBI_KEY
-    
-    EUTILS_ESEARCH = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    NCBI_SLEEP_SEC = 0.11 if NCBI_KEY else 0.34
-    
-    field = {"GRCh38": "chrpos38", "GRCh37": "chrpos37"}.get(assembly, "chrpos38")
-    key = (chrom, int(start), int(end), field)
-    if key in chrom_region_cache:
-        return chrom_region_cache[key]
-    base = f'{chrom}[chr] AND {start}:{end}[{field}]'
-    tl_p = f'({base}) AND ("clinsig pathogenic"[Properties] OR "clinsig likely pathogenic"[Properties])'
-    tl_b = f'({base}) AND ("clinsig benign"[Properties] OR "clinsig likely benign"[Properties])'
-    params["term"] = tl_p
-    r = requests.get(EUTILS_ESEARCH, params=params, timeout=60)
-    p_lp_count = int(r.json().get("esearchresult", {}).get("count", 0))
+# varId spells X and Y as 23 and 24; FRASER reports chrX and chrY. Without
+# this the lookup matches nothing and reports zero, which reads exactly like a
+# region with no ClinVar records.
+_CHROM_ALIASES = {"X": "23", "Y": "24", "M": "MT"}
 
-    time.sleep(NCBI_SLEEP_SEC)
-    params["term"] = tl_b
-    r = requests.get(EUTILS_ESEARCH, params=params, timeout=60)
-    b_lb_count = int(r.json().get("esearchresult", {}).get("count", 0))
 
-    ratio = (p_lp_count / b_lb_count) if b_lb_count > 0 else None
-    chrom_region_cache[key] = (p_lp_count, b_lb_count, ratio)
-    time.sleep(NCBI_SLEEP_SEC)
-    return chrom_region_cache[key]
+def _clnsig_tokens(value):
+    """
+    The classification tokens in one CLNSig cell.
 
+    The column holds the repr of a one-element tuple rather than a tuple -
+    "('Benign|association',)" - so the wrapper comes off textually. A record
+    carrying several classifications joins them with '|' inside that element,
+    and 'Pathogenic/Likely_pathogenic' is one token rather than two.
+    """
+    if not isinstance(value, str):
+        return ()
+    inner = value.strip()
+    if inner.startswith(("('", '("')) and inner.endswith(("',)", '",)')):
+        inner = inner[2:-3]
+    if inner in ("", "None"):
+        return ()
+    return tuple(t for t in inner.split("|") if t)
+
+
+def load_clinvar_regions(clinvar_feather, cache_path, overwrite=False):
+    """
+    Build, or reuse, the structure clinvar_region_counts() searches.
+
+    Counting pathogenic and benign records in a window is an interval query
+    over a local table, not a question for a web service. Doing it here removes
+    the rate limit, the network dependency and the re-querying every run, and
+    makes the numbers reproducible: a pinned ClinVar release answers the same
+    way next year, a live query does not.
+
+    The prepared form is cached because parsing four million varIds and sorting
+    them takes the better part of a minute, and the result varies by neither
+    sample nor run. What is rebuilt each call is the per-chromosome cumulative
+    index, which is a groupby over an already-sorted table and costs
+    milliseconds.
+
+    The table carries one genome build and nothing says which, so it has to
+    match the build the candidates were called against - which it does by
+    construction, being the same file DatabaseAgent merges on varId.
+
+    Returns {chrom: (positions, plp_cumulative, blb_cumulative)}, the
+    cumulative arrays one longer than positions so a count is one subtraction.
+    """
+    cache_path = Path(cache_path)
+    if cache_path.exists() and not overwrite:
+        prepared = pd.read_feather(cache_path)
+    else:
+        cv = pd.read_feather(clinvar_feather, columns=["varId", "CLNSig"])
+        parts = cv["varId"].astype(str).str.split("_", n=2, expand=True)
+
+        def _flags(value):
+            ts = _clnsig_tokens(value)
+            return (any(t in _PLP_TOKENS for t in ts),
+                    any(t in _BLB_TOKENS for t in ts))
+
+        flags = cv["CLNSig"].map(_flags)
+        prepared = pd.DataFrame({
+            "chrom": parts[0],
+            "pos": pd.to_numeric(parts[1], errors="coerce"),
+            "is_plp": flags.str[0],
+            "is_blb": flags.str[1],
+        })
+
+        prepared = (prepared.dropna(subset=["pos"])
+                    .astype({"pos": "int32"})
+                    .sort_values(["chrom", "pos"])
+                    .reset_index(drop=True))
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.parent / f".{cache_path.name}.tmp"
+        prepared.to_feather(tmp)
+        os.replace(tmp, cache_path)
+
+    regions = {}
+    for chrom, block in prepared.groupby("chrom", sort=False):
+        regions[str(chrom)] = (
+            block["pos"].to_numpy(),
+            np.concatenate([[0], np.cumsum(block["is_plp"].to_numpy(),
+                                           dtype=np.int32)]),
+            np.concatenate([[0], np.cumsum(block["is_blb"].to_numpy(),
+                                           dtype=np.int32)]),
+        )
+    return regions
+
+
+def clinvar_region_counts(regions, chrom, start, end):
+    """
+    (P/LP, B/LB, ratio) for one window, or (0, 0, None) off the map.
+
+    Binary search into the sorted positions, then one subtraction on each
+    cumulative array, so the work is constant however wide the window.
+    """
+    chrom = str(chrom)
+    if chrom.startswith("chr"):
+        chrom = chrom[3:]
+    chrom = _CHROM_ALIASES.get(chrom, chrom)
+
+    entry = regions.get(chrom)
+    if entry is None:
+        return 0, 0, None
+    positions, plp_cum, blb_cum = entry
+    lo = int(np.searchsorted(positions, int(start), side="left"))
+    hi = int(np.searchsorted(positions, int(end), side="right"))
+    p_lp = int(plp_cum[hi] - plp_cum[lo])
+    b_lb = int(blb_cum[hi] - blb_cum[lo])
+    return p_lp, b_lb, (p_lp / b_lb if b_lb > 0 else None)
 
 # ---------------------------------------------------------------------------
 # Allele quantification straight from the BAM
@@ -498,8 +659,10 @@ def AlleleQuantification(samplesheet, work_dir, overwrite=False, max_workers=4):
         bam = getattr(row, "rna_path", None)
         if isinstance(bam, float) and pd.isna(bam):
             bam = None
+        out_dir = analysis_subdir(output_root.parent, row_analysis(row)) / output_root.name
+        out_dir.mkdir(parents=True, exist_ok=True)
         jobs.append((str(row.sampleID), Path(cand), str(bam).strip() if bam else "",
-                     output_root / f"{row.sampleID}.feather"))
+                     out_dir / f"{row.sampleID}.feather"))
 
     if not jobs:
         print("  nothing to quantify")
@@ -546,6 +709,21 @@ def _write_json_atomic(path, obj):
         json.dump(obj, fh)
     os.replace(tmp, path)
 
+def _write_prompt(path, text):
+    """
+    Store one prompt beside its answer, atomically and only once.
+
+    Returning early when the file is there keeps a re-run from rewriting
+    thousands of identical files, and makes the caller's two-step check - is
+    the prompt kept, is the answer kept - independent of each other.
+    """
+    path = Path(path)
+    if path.exists():
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.parent / f".{path.name}.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
 
 def _rna_llm_one(task, llm_config, overwrite):
     """Send one prompt and store the answer. Returns 'done' or 'skipped'."""
@@ -603,18 +781,16 @@ def _outrider_items(rows):
     }
 
 
-def _build_tasks(samplesheet, output_root, clingen, use_ncbi,
-                 clinvar_assembly, ncbi_email, ncbi_key, overwrite):
+def _build_tasks(samplesheet, output_root, clingen, clinvar_regions, overwrite):
     """
     Turn every sample's candidate table into a flat list of prompts.
 
-    Serial and up front, for two reasons. It is cheap next to the model calls,
-    and it is where the ClinVar lookups happen - those share a cache with no
-    lock and are bound by NCBI's rate limit, so they cannot move into the
-    worker pool with everything else.
+    Serial and up front because it is cheap next to the model calls. The
+    ClinVar lookups are local interval searches, so the rate limit that once
+    kept them out of the worker pool is gone; there is just no reason to
+    parallelise string formatting.
     """
     tasks = []
-    region_cache = {}
     n_no_rna = 0
     n_reused = 0
 
@@ -641,8 +817,13 @@ def _build_tasks(samplesheet, output_root, clingen, use_ncbi,
             n_no_rna += 1
             continue
 
-        gene_dir = output_root / "GeneLevelEval" / sample_id
-        variant_dir = output_root / "VariantLevelEval" / sample_id
+        # The readings quote this patient's FRASER and OUTRIDER numbers, which
+        # are what changes between analyses, so they cannot be shared.
+        agent_root = analysis_subdir(output_root, row_analysis(row))
+        gene_dir = agent_root / "GeneLevelEval" / sample_id
+        variant_dir = agent_root / "VariantLevelEval" / sample_id
+        gene_prompt_dir = agent_root / "Prompt_Gene" / sample_id
+        variant_prompt_dir = agent_root / "Prompt_Variant" / sample_id
 
         for gene, gene_rows in candidates.groupby("geneSymbol", dropna=False):
             clingen_text = _clingen_block(gene, clingen)
@@ -656,21 +837,31 @@ def _build_tasks(samplesheet, output_root, clingen, use_ncbi,
             sig_gene = gene_rows[gene_rows["Is_outlier"] | gene_rows["Is_Splicing_gene"]]
             if not sig_gene.empty:
                 out_path = gene_dir / f"{gene}.json"
-                if out_path.exists() and not overwrite:
+                prompt_path = gene_prompt_dir / f"{gene}.txt"
+                # Prompt and answer are checked separately, so an evaluation
+                # made before prompts were kept gets its prompt on the next run
+                # without the model being asked again.
+                have_answer = out_path.exists() and not overwrite
+                if have_answer and prompt_path.exists():
                     n_reused += 1
                 else:
                     outrider = _outrider_items(sig_gene)
                     if outrider is not None:
-                        tasks.append({
-                            "label": f"{sample_id}/{gene} (gene)",
-                            "output_path": gene_dir / f"{gene}.json",
-                            "prompt": build_prompt_RNA_agent_gene(
-                                gene=str(gene),
-                                fraser_pvalue_gene=_fmt(sig_gene["Fraser_GenePvalue"].iloc[0]),
-                                outrider_items=outrider,
-                                gene_constraints=constraints,
-                                inheritance_flags=inheritance,
-                                clingen_dosage=clingen_text)})
+                        prompt = build_prompt_RNA_agent_gene(
+                            gene=str(gene),
+                            fraser_pvalue_gene=_fmt(sig_gene["Fraser_GenePvalue"].iloc[0]),
+                            outrider_items=outrider,
+                            gene_constraints=constraints,
+                            inheritance_flags=inheritance,
+                            clingen_dosage=clingen_text)
+                        _write_prompt(prompt_path, prompt)
+                        if have_answer:
+                            n_reused += 1
+                        else:
+                            tasks.append({
+                                "label": f"{sample_id}/{gene} (gene)",
+                                "output_path": out_path,
+                                "prompt": prompt})
 
             sig_var = gene_rows[gene_rows["Is_Splicing_variant"] | gene_rows["Is_ASE"]]
             if sig_var.empty:
@@ -679,20 +870,45 @@ def _build_tasks(samplesheet, output_root, clingen, use_ncbi,
 
             for var in sig_var.itertuples(index=False):
                 out_path = variant_dir / f"{gene}_VarId_{var.varId}.json"
-                if out_path.exists() and not overwrite:
+                prompt_path = variant_prompt_dir / f"{gene}_VarId_{var.varId}.txt"
+                have_answer = out_path.exists() and not overwrite
+                if have_answer and prompt_path.exists():
                     n_reused += 1
                     continue
                 p_lp, b_lb, ratio = 0, 0, None
-                if use_ncbi:
-                    try:
-                        p_lp, b_lb, ratio = clinvar_region_metrics(
-                            var.Chromosome[3:],
-                            int(var.Fraser_junction_start),
-                            int(var.Fraser_junction_end),
-                            clinvar_assembly, region_cache, ncbi_email, ncbi_key,
-                        )
-                    except Exception:
-                        pass
+                has_window = (clinvar_regions is not None
+                              and not pd.isna(var.Fraser_junction_start)
+                              and not pd.isna(var.Fraser_junction_end))
+                if has_window:
+                    p_lp, b_lb, ratio = clinvar_region_counts(
+                        clinvar_regions,
+                        var.Chromosome,
+                        int(var.Fraser_junction_start),
+                        int(var.Fraser_junction_end),
+                    )
+                if not has_window:
+                    p_lp_text = b_lb_text = "n/a"
+                    ratio_text = "no splicing junction at this variant"
+                else:
+                    p_lp_text, b_lb_text = p_lp, b_lb
+                    if b_lb > 0:
+                        ratio_text = _fmt(ratio)
+                    elif p_lp > 0:
+                        ratio_text = "undefined - no benign records in this region"
+                    else:
+                        ratio_text = "undefined - no classified records in this region"
+
+                # "None" reads like missing data, but a window with pathogenic
+                # records and no benign ones is a strong signal rather than an
+                # absent one - and it is distinct again from a window ClinVar
+                # has nothing on at all. The model only ever sees this as text,
+                # so the distinction has to be made in the text.
+                if b_lb > 0:
+                    ratio_text = _fmt(ratio)
+                elif p_lp > 0:
+                    ratio_text = "undefined - no benign records in this region"
+                else:
+                    ratio_text = "undefined - no classified records in this region"
 
                 fraser_items = {
                     "Chrom": var.Chromosome,
@@ -710,10 +926,11 @@ def _build_tasks(samplesheet, output_root, clingen, use_ncbi,
                     "delta_psi5": _fmt(var.Fraser_delta_psi5),
                     "delta_psi3": _fmt(var.Fraser_delta_psi3),
                     "predictedMeans_jaccard": _fmt(var.Fraser_predictedMeans_jaccard),
-                    "P_LP_count": p_lp,
-                    "B_LB_count": b_lb,
-                    "P_LP_to_B_LB_ratio": _fmt(ratio) if ratio is not None else None,
+                    "P_LP_count": p_lp_text,
+                    "B_LB_count": b_lb_text,
+                    "P_LP_to_B_LB_ratio": ratio_text,
                 }
+
 
                 ase_items = None
                 if not pd.isna(var.ASE_PVAL) and var.zyg == 1:
@@ -724,18 +941,24 @@ def _build_tasks(samplesheet, output_root, clingen, use_ncbi,
                         "ALT_RATIO": _fmt(var.ASE_ALT_RATIO),
                     }
 
+                prompt = build_prompt_RNA_agent_variant(
+                    gene=gene,
+                    fraser_items=fraser_items,
+                    outrider_items=outrider,
+                    ase_items=ase_items,
+                    gene_constraints=constraints,
+                    inheritance_flags=inheritance,
+                    clingen_dosage=clingen_text,
+                )
+                _write_prompt(prompt_path, prompt)
+                if have_answer:
+                    n_reused += 1
+                    continue
+
                 tasks.append({
                     "label": f"{sample_id}/{gene}/{var.varId}",
-                    "output_path": variant_dir / f"{gene}_VarId_{var.varId}.json",
-                    "prompt": build_prompt_RNA_agent_variant(
-                        gene=gene,
-                        fraser_items=fraser_items,
-                        outrider_items=outrider,
-                        ase_items=ase_items,
-                        gene_constraints=constraints,
-                        inheritance_flags=inheritance,
-                        clingen_dosage=clingen_text,
-                    ),
+                    "output_path": out_path,
+                    "prompt": prompt,
                 })
 
     return tasks, n_no_rna, n_reused
@@ -748,8 +971,7 @@ def _get_available_cpus():
         return os.cpu_count() or 1
 
 def RunAgent(samplesheet, work_dir, llm_config, references, ref_ver,
-             overwrite=False, use_ncbi=True,
-             ncbi_email=None, ncbi_key=None, quant_workers=None):
+             overwrite=False, clinvar_burden=True, quant_workers=None):
     """
     Run the RNA Agent over the candidates of every sample.
 
@@ -777,9 +999,10 @@ def RunAgent(samplesheet, work_dir, llm_config, references, ref_ver,
         llm_config: dict with model_name, ollama_url, temperature, num_parallel.
         clingen_dosage: path to the ClinGen dosage-sensitivity CSV.
         overwrite: redo work that already has output.
-        use_ncbi: look up the ClinVar burden per junction region. Off by
-            default; it adds a rate-limited network round trip each.
-        clinvar_assembly, ncbi_email, ncbi_key: passed to that lookup.
+        clinvar_burden: include the per-junction count of pathogenic and benign
+            ClinVar records in the variant-level prompt. Read from the local
+            ClinVar table, so this costs one table load and nothing per
+            lookup.
         quant_workers: samples quantified at once in the first stage.
 
     Returns:
@@ -824,9 +1047,15 @@ def RunAgent(samplesheet, work_dir, llm_config, references, ref_ver,
     clingen = clingen_raw[required].set_index("GENE SYMBOL")
 
     print("3. Generating prompts ...")
+    clinvar_regions = None
+    if clinvar_burden:
+        clinvar_regions = load_clinvar_regions(
+            references.rarecollab.clinvar_feather,
+            Path(work_dir) / "Agents" / "RNA" / "clinvar_regions.feather",
+        )
+
     tasks, n_no_rna, n_reused = _build_tasks(
-        samplesheet, output_root, clingen,
-        use_ncbi, assembly, ncbi_email, ncbi_key, overwrite
+        samplesheet, output_root, clingen, clinvar_regions, overwrite
     )
     n_gene = sum(1 for t in tasks if t["label"].endswith("(gene)"))
     print(f"   {len(tasks)} prompt(s): {n_gene} gene-level, "

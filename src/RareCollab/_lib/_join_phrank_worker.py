@@ -184,6 +184,16 @@ def _add_c_nc(score_df, clin_c, clin_nc, hgmd_c, hgmd_nc):
     
     return merged
 
+def join_phrank_output(scores_csv_path, sample_id, work_dir):
+    """
+    Where JOIN_PHRANK's output lands for one (sample, chromosome) task.
+
+    Shared with the parallel dispatcher so it can tell what is already done
+    without opening a process pool.
+    """
+    scores_basename = Path(scores_csv_path).name[:-len(".csv")]
+    return (Path(work_dir) / "features" / str(sample_id)
+            / f"{scores_basename}.txt.gz")
 
 def JOIN_PHRANK(scores_csv_path, phrank_txt_path, sample_id, work_dir,
                 references, ref_ver,
@@ -216,10 +226,8 @@ def JOIN_PHRANK(scores_csv_path, phrank_txt_path, sample_id, work_dir,
     if not phrank_txt_path.exists():
         raise FileNotFoundError(f"Phrank txt not found: {phrank_txt_path}")
 
-    scores_basename = scores_csv_path.name[:-len(".csv")]  # "chr1.vep_scores"
-    sample_dir = work_dir / "features" / sample_id
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    output_path = sample_dir / f"{scores_basename}.txt.gz"
+    output_path = join_phrank_output(scores_csv_path, sample_id, work_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
         if output_path.exists() or output_path.is_symlink():
@@ -272,26 +280,41 @@ def run_join_phrank_parallel(samplesheet, work_dir, references, ref_ver,
     join_results = {}
     ok = fail = 0
 
+    pending = []
+    for row in samplesheet.itertuples(index=True):
+        for scores_csv in row.scores_csv_paths:
+            out = join_phrank_output(scores_csv, row.sampleID, work_dir)
+            if not overwrite and out.exists():
+                join_results.setdefault(row.Index, []).append(str(out))
+                continue
+            pending.append((row, scores_csv))
+
+    n_cached = sum(len(v) for v in join_results.values())
+    if not pending:
+        print(f"JOIN PHRANK: all {n_cached} task(s) already computed.")
+        return {idx: sorted(paths) for idx, paths in join_results.items()}
+    if n_cached:
+        print(f"JOIN PHRANK: {n_cached} task(s) cached, {len(pending)} to compute.")
+
     with ProcessPoolExecutor(
-        max_workers=max_workers,
+        max_workers=min(max_workers, len(pending)),
         initializer=_init_join_phrank_worker,
         initargs=(references, ref_ver),
         mp_context=mp.get_context("spawn"),
     ) as ex:
-        for row in samplesheet.itertuples(index=True):
-            for scores_csv in row.scores_csv_paths:
-                future = ex.submit(
-                    _join_phrank_worker_run,
-                    scores_csv, row.phrank_txt_path,
-                    row.sampleID, work_dir, references, ref_ver,
-                    overwrite,
-                )
-                tasks.append({
-                    "index": row.Index,
-                    "sampleID": row.sampleID,
-                    "scores_csv": scores_csv,
-                    "future": future,
-                })
+        for row, scores_csv in pending:
+            future = ex.submit(
+                _join_phrank_worker_run,
+                scores_csv, row.phrank_txt_path,
+                row.sampleID, work_dir, references, ref_ver,
+                overwrite,
+            )
+            tasks.append({
+                "index": row.Index,
+                "sampleID": row.sampleID,
+                "scores_csv": scores_csv,
+                "future": future,
+            })
 
         with tqdm(total=len(tasks), desc="JOIN PHRANK") as pbar:
             future_to_task = {t["future"]: t for t in tasks}

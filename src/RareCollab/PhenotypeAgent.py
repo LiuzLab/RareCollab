@@ -353,8 +353,10 @@ def hpo_llm_one(model_name, ollama_url, temperature,
     output_dir.mkdir(parents=True, exist_ok=True)
     output_txt = output_dir / f"{gene}.txt"
     output_json = output_dir / f"{gene}.json"
+    prompt_path = llm_dir / "Prompt" / sample_id / f"{gene}.txt"
 
-    if output_json.exists() and not overwrite:
+    have_answer = output_json.exists() and not overwrite
+    if have_answer and prompt_path.exists():
         return 1
 
     if patient_terms == "All":
@@ -363,6 +365,16 @@ def hpo_llm_one(model_name, ollama_url, temperature,
     prompt_text = build_prompt_HPO_agent(
         gene=gene, patient_terms=patient_terms, hpo_gene_des=hpo_gene_des,
     )
+
+    if not prompt_path.exists():
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_prompt = prompt_path.parent / f".{prompt_path.name}.tmp"
+        tmp_prompt.write_text(prompt_text, encoding="utf-8")
+        os.replace(tmp_prompt, prompt_path)
+
+    if have_answer:
+        return 1
+    
     payload = {
         "model": model_name,
         "prompt": prompt_text,
@@ -546,6 +558,65 @@ If you cannot comply, output exactly:{{"Reasoning":"comply_error","Conclusion":"
 """
     return prompt
 
+
+class _PromptPlaceholders(dict):
+    """
+    A mapping whose every lookup yields a self-labelling placeholder.
+
+    __bool__ is pinned true because an empty dict is falsy, and a builder that
+    gates a section on `if items:` would otherwise silently leave it out of
+    what ShowPrompt prints - the one thing this function must not do.
+    """
+
+    def __missing__(self, key):
+        return f"<{key}>"
+
+    def __bool__(self):
+        return True
+
+
+_PROMPTS = ("HPO", "OMIM", "Literature")
+
+def ShowPrompt(which=None):
+    """
+    Print one of this agent's prompts, with the per-case parts marked.
+
+    Rendered by the real builders so they cannot drift out of date. Not
+    configurable: the conclusion labels they define are parsed downstream and
+    feed the Tier rules.
+
+    Called with no argument, lists what there is to ask for rather than
+    guessing which one was meant.
+    """
+
+    if which not in _PROMPTS:
+        if which is not None:
+            print(f"Unknown prompt: {which!r}\n")
+        print(f"PhenotypeAgent sends {len(_PROMPTS)} prompts: "
+              f"{', '.join(repr(p) for p in _PROMPTS)}\n"
+              f"  ShowPrompt('{_PROMPTS[0]}')")
+        return
+
+    if which == "HPO":
+        print(build_prompt_HPO_agent(
+            gene="<GENE>",
+            patient_terms="<HP:0001250, HP:0001263, ...>",
+            hpo_gene_des="<HPO terms annotated to this gene>",
+        ))
+    elif which == "OMIM":
+        print(build_prompt_OMIM_agent(
+            "<GENE>",
+            "<HP:0001250, HP:0001263, ...>",
+            "<OMIM entries for this gene>",
+        ))
+    else:
+        print(build_prompt_Literature_agent(
+            gene="<GENE>",
+            phenotype_text="<HP:0001250, HP:0001263, ...>",
+            lit_items=[_PromptPlaceholders()],
+        ))
+
+
 def omim_llm_one(model_name, ollama_url, temperature,
                  llm_dir, sample_id, gene,
                  patient_terms, omim_entries,
@@ -560,8 +631,10 @@ def omim_llm_one(model_name, ollama_url, temperature,
     output_dir.mkdir(parents=True, exist_ok=True)
     output_txt = output_dir / f"{gene}.txt"
     output_json = output_dir / f"{gene}.json"
+    prompt_path = llm_dir / "Prompt" / sample_id / f"{gene}.txt"
 
-    if output_json.exists() and not overwrite:
+    have_answer = output_json.exists() and not overwrite
+    if have_answer and prompt_path.exists():
         return 1
 
     if not omim_entries:
@@ -571,6 +644,16 @@ def omim_llm_one(model_name, ollama_url, temperature,
         patient_terms = ""
 
     prompt_text = build_prompt_OMIM_agent(gene, patient_terms, omim_entries)
+
+    if not prompt_path.exists():
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_prompt = prompt_path.parent / f".{prompt_path.name}.tmp"
+        tmp_prompt.write_text(prompt_text, encoding="utf-8")
+        os.replace(tmp_prompt, prompt_path)
+
+    if have_answer:
+        return 1
+
     payload = {
         "model": model_name,
         "prompt": prompt_text,
@@ -1073,10 +1156,12 @@ def literature_llm_one(model_name, ollama_url, temperature,
     output_dir.mkdir(parents=True, exist_ok=True)
     output_txt = output_dir / f"{gene}.txt"
     output_json = output_dir / f"{gene}.json"
-    
-    if output_json.exists() and not overwrite:
+    prompt_path = llm_dir / "Prompt" / sample_id / f"{gene}.txt"
+
+    have_answer = output_json.exists() and not overwrite
+    if have_answer and prompt_path.exists():
         return 1
-    
+
     with abstract_path.open("r", encoding="utf-8") as f:
         gene_abstract = json.load(f)
     
@@ -1088,6 +1173,16 @@ def literature_llm_one(model_name, ollama_url, temperature,
     prompt_text = build_prompt_Literature_agent(
         gene=gene, phenotype_text=patient_terms, lit_items=lit_items,
     )
+
+    if not prompt_path.exists():
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_prompt = prompt_path.parent / f".{prompt_path.name}.tmp"
+        tmp_prompt.write_text(prompt_text, encoding="utf-8")
+        os.replace(tmp_prompt, prompt_path)
+
+    if have_answer:
+        return 1
+
     payload = {
         "model": model_name,
         "prompt": prompt_text,

@@ -4,27 +4,30 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "RareCollab"
-version = "1.0.0"
+version = "2.0.0"
 description = "RareCollab - A Multimodal Diagnostic Copilot for Mendelian Disorders"
+license = "GPL-3.0-only"
+license-files = ["LICENSE"]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 authors = [
     { name = "Jiasheng Wang", email = "jiashenw@bcm.edu" },
     { name = "Guantong Qi", email = "Guantong.Qi@bcm.edu" }
 ]
 dependencies = [
-    "requests",
-    "pandas",
-    "tqdm",
-    "numpy",
-    "pyranges",
-    "torch",
-    "pysam",
-    "pronto",
-    "biopython",
-    "scipy",
-    "pyreadr",
-    "phrank",
+    "requests>=2.28",
+    "pandas>=2.0,<3.0",
+    "tqdm>=4.64",
+    "numpy>=1.24",
+    "pyranges>=0.1,<1.0",
+    "torch>=2.0",
+    "pysam>=0.22",
+    "pronto>=2.5",
+    "biopython>=1.80",
+    "scipy>=1.10",
+    "pyreadr>=0.5",
+    "phrank>=1.6",
+    "pyarrow>=14",
 ]
 
 [tool.setuptools]
@@ -35,3 +38,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "RareCollab._rscript" = ["*.R"]
+
+[project.urls]
+Homepage = "https://github.com/LiuzLab/RareCollab"
+Issues = "https://github.com/LiuzLab/RareCollab/issues"

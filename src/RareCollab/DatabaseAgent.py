@@ -1,16 +1,17 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-import time
-import requests
 import os
-import pandas as pd
-from pathlib import Path
-import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-import pickle
+import time
 import json
+import pickle
+import requests
+import pandas as pd
+import xml.etree.ElementTree as ET
+from pathlib import Path
+from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from ._lib._analysis import analysis_subdir, row_analysis
 
 def Call_NCBI_API(url, params, max_try = 3, timeout = 60):
     for attempt in range(max_try + 1):
@@ -111,8 +112,27 @@ Output MUST be valid JSON on a single line. No markdown. No code fences. No extr
 """
   return prompt
 
+def ShowPrompt():
+    """
+    Print the prompt this agent sends, with the per-variant parts marked.
+
+    Rendered by the real builder rather than from a copy of the text, so it
+    cannot drift. A stale copy would be worse than nothing here: the only
+    reason to read this is to trust it.
+
+    The prompt is not configurable. The conclusion and zygosity labels it
+    defines are parsed downstream and fed into the Tier rules, so rewording
+    them would quietly change results rather than just change the wording.
+    """
+    print(build_prompt_en(
+        var_key="<CHROM_POS_REF_ALT>",
+        HGVSc_core="<HGVSc>",
+        preview_blocks=["<ClinVar submission 1, rendered from its XML>",
+                        "<ClinVar submission 2, ...>"],
+    ))
+
 def database_process_one(varId, vid, clinvar_submissions_dir, params,
-                         url, max_try, truncate, overwrite=False):
+                         url, max_try, overwrite=False):
     """Fetch ClinVar submission XML for one variant. Atomic write."""
     output_path = clinvar_submissions_dir / f"{varId}.pkl"
     if output_path.exists() and not overwrite:
@@ -125,38 +145,60 @@ def database_process_one(varId, vid, clinvar_submissions_dir, params,
     if cal is None:
         return 0
     
-    blocks = []
-    for cas in cal.findall("./ClinicalAssertion"):
-        lines = _element_to_lines(cas, depth=0)
-        block = "\n".join(lines)
-        if truncate and len(block) > truncate:
-            block = block[:truncate] + "..."
-        blocks.append(block)
+    blocks = ["\n".join(_element_to_lines(cas, depth=0))
+              for cas in cal.findall("./ClinicalAssertion")]
     
-    tmp = clinvar_submissions_dir / f".{varId}.pkl.tmp"
-    with open(tmp, "wb") as f:
-        pickle.dump(blocks, f, protocol=pickle.HIGHEST_PROTOCOL)
-    os.replace(tmp, output_path)
+    # The temporary name carries the pid. A shared store can have several runs
+    # fetching at once, and a fixed name lets one truncate another's partial
+    # write, leaving a corrupt pickle that os.replace then publishes as good -
+    # and that bad record is what every later run would read.
+    tmp = clinvar_submissions_dir / f".{varId}.{os.getpid()}.pkl.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(blocks, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, output_path)
+    finally:
+        tmp.unlink(missing_ok=True)
     return 1
 
 def call_ollama_one(model_name, ollama_url, temperature,
                     llm_res_dir, clinvar_submissions_dir,
-                    varId, HGVSc_core, overwrite=False):
+                    varId, HGVSc_core, truncate=None, overwrite=False):
     """Call LLM for one variant. Atomic write of both txt and json outputs."""
     output_txt = llm_res_dir / "txt" / f"{varId}.txt"
     output_json = llm_res_dir / "json" / f"{varId}.json"
-    if output_json.exists() and not overwrite:
+    prompt_path = llm_res_dir / "Prompt" / f"{varId}.txt"
+
+    # The prompt and the answer are checked separately, so a result produced
+    # before prompts were kept gets its prompt written on the next run without
+    # the LLM being called again. Building one costs a file read and some
+    # string formatting; re-answering costs an inference.
+    have_answer = output_json.exists() and not overwrite
+    if have_answer and prompt_path.exists():
         return 1
-    
+
     pkl_path = clinvar_submissions_dir / f"{varId}.pkl"
     if not pkl_path.exists():
         # Upstream NCBI fetch missed this variant; skip
         return 0
-    
+
     with open(pkl_path, "rb") as f:
         block = pickle.load(f)
-    
+
+    if truncate:
+        block = [b[:truncate] + "..." if len(b) > truncate else b for b in block]
+
     prompt_text = build_prompt_en(var_key=varId, HGVSc_core=HGVSc_core, preview_blocks=block)
+
+    if not prompt_path.exists():
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_prompt = prompt_path.parent / f".{prompt_path.name}.tmp"
+        tmp_prompt.write_text(prompt_text, encoding="utf-8")
+        os.replace(tmp_prompt, prompt_path)
+
+    if have_answer:
+        return 1
+
     payload = {
         "model": model_name,
         "prompt": prompt_text,
@@ -206,7 +248,7 @@ def clinvar_process_one(sample_id, candidates_path, output_path, ClinVar, overwr
 
 def RunAgent(samplesheet, work_dir, references, llm_config,
              ncbi_email=None, ncbi_api_key=None,
-             config=None, overwrite=False):
+             local_clinvar=None, config=None, overwrite=False):
     """
     Run DNA Database Agent: filter candidates with ClinVar submissions,
     fetch ClinVar evidence from NCBI, and evaluate using LLM.
@@ -223,6 +265,13 @@ def RunAgent(samplesheet, work_dir, references, llm_config,
         references: AimReferences (uses references.rarecollab.clinvar_feather).
         llm_config: Dict with keys model_name, ollama_url, temperature.
         ncbi_email: NCBI account email (optional, increases rate limit).
+        local_clinvar: directory holding ClinVar submission records, shared
+            across runs and across cohorts. Left None, records live under
+            work_dir and serve that one work directory. Given a path, that
+            directory is read first and anything newly fetched is written back
+            to it, so a library downloaded once serves every later run. The
+            directory must already exist: creating it on demand would turn a
+            mistyped path into a silent re-download of everything.
         ncbi_api_key: NCBI API key (optional, increases rate limit).
         config: Optional worker config dict.
         overwrite: Re-run even if outputs exist.
@@ -243,10 +292,35 @@ def RunAgent(samplesheet, work_dir, references, llm_config,
     clinvar_filtered_dir = output_root / "ClinVarFiltered"
     clinvar_submissions_dir = output_root / "ClinVarVariants"
     llm_res_dir = output_root / "AgentEvaluation"
-    
-    for d in [clinvar_filtered_dir, clinvar_submissions_dir,
-              llm_res_dir / "txt", llm_res_dir / "json"]:
+
+    for d in [clinvar_filtered_dir, llm_res_dir / "txt", llm_res_dir / "json"]:
         d.mkdir(parents=True, exist_ok=True)
+
+    # A ClinVar record describes a variant, not a patient, so it is the same
+    # record whoever asks for it. Pointing several runs at one directory turns
+    # the per-variant NCBI fetch into a one-off cost for the whole programme
+    # rather than a cost per cohort, which is what makes a large batch feasible.
+    if local_clinvar is None:
+        clinvar_submissions_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        clinvar_submissions_dir = Path(local_clinvar)
+        if not clinvar_submissions_dir.is_dir():
+            raise NotADirectoryError(
+                f"local_clinvar is not an existing directory: "
+                f"{clinvar_submissions_dir}\n"
+                f"  Create it first. It is deliberately not created on demand: "
+                f"a mistyped path would look like an empty library and quietly "
+                f"re-download every record."
+            )
+        if not os.access(clinvar_submissions_dir, os.W_OK):
+            raise PermissionError(
+                f"local_clinvar is not writable: {clinvar_submissions_dir}\n"
+                f"  Newly fetched records are written back to it, so a "
+                f"read-only store would fail partway through."
+            )
+        n_held = sum(1 for _ in clinvar_submissions_dir.glob("*.pkl"))
+        print(f"Local ClinVar store: {clinvar_submissions_dir} "
+              f"({n_held:,} record(s) already held)")
     
     # NCBI request params
     url = 'https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi'
@@ -263,7 +337,7 @@ def RunAgent(samplesheet, work_dir, references, llm_config,
     NCBI_WORKERS = 2  # NCBI rate limit
     LLM_WORKERS = llm_config.get("num_parallel", 1)   # match OLLAMA_NUM_PARALLEL
     MAX_TRY = 3
-    TRUNCATE = 3000
+    TRUNCATE = 3000 # per-submission cap applied when building the prompt
     
     # ===== Step 1: Filter candidates by ClinVar =====
     print("1. Filtering candidates by ClinVar membership ...")
@@ -276,7 +350,12 @@ def RunAgent(samplesheet, work_dir, references, llm_config,
         for row in samplesheet.itertuples(index=True):
             sample_id = row.sampleID
             candidates_path = Path(row.candidates_path)
-            output_path = clinvar_filtered_dir / f"{sample_id}.feather"
+            # Follows the candidate list it filters. Step 2 concatenates these
+            # and dedups by varId, so the union across analyses still reaches
+            # NCBI and the model exactly once per variant.
+            out_dir = analysis_subdir(clinvar_filtered_dir, row_analysis(row))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output_path = out_dir / f"{sample_id}.feather"
             
             fut = ex.submit(
                 clinvar_process_one, sample_id, candidates_path,
@@ -318,7 +397,7 @@ def RunAgent(samplesheet, work_dir, references, llm_config,
         futures = [
             ex.submit(database_process_one,
                       varId, vid, clinvar_submissions_dir,
-                      params, url, MAX_TRY, TRUNCATE, overwrite)
+                      params, url, MAX_TRY, overwrite)
             for (varId, vid, _) in input_tuples
         ]
         ok = fail = 0
@@ -344,7 +423,7 @@ def RunAgent(samplesheet, work_dir, references, llm_config,
                       llm_config["ollama_url"],
                       llm_config["temperature"],
                       llm_res_dir, clinvar_submissions_dir,
-                      varId, HGVSc_core, overwrite)
+                      varId, HGVSc_core, TRUNCATE, overwrite)
             for (varId, _, HGVSc_core) in input_tuples
         ]
         ok = fail = 0

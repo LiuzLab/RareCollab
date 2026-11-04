@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import requests
+import signal
 from pathlib import Path
 
 import pandas as pd
@@ -896,6 +897,41 @@ def LoadRNABackground(csv_path, existing_sample_ids=None):
     print(f"{len(df)} background RNA file(s) found and kept.")
     return df[["sampleID", "rna_path", "strand", "pairedEnd"]].reset_index(drop=True)
 
+def CheckLLMServer(ollama_url, model_name=None, timeout=5):
+    """
+    Confirm a server answers and, if asked, that it holds the model.
+
+    Worth calling before a run rather than discovering it during one: the
+    agents meet a wrong URL or a missing model one request at a time, hours
+    in, and every failure looks like a model error rather than a setup one.
+
+    Returns the model names the server holds.
+    """
+    url = str(ollama_url).rstrip("/")
+    try:
+        response = requests.get(f"{url}/api/tags", timeout=timeout)
+        response.raise_for_status()
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"No Ollama server answering at {url} ({type(exc).__name__}). "
+            f"Start one with Setup.LaunchLocalLLMServer() on this machine, or "
+            f"Setup.LaunchLLMServer() on SLURM, or pass the URL of a server "
+            f"running elsewhere."
+        ) from exc
+
+    models = [m.get("name", "") for m in response.json().get("models", [])]
+    if model_name and not any(m == model_name or m.startswith(f"{model_name}:")
+                              for m in models):
+        raise RuntimeError(
+            f"{url} is running but does not hold {model_name!r}. It has: "
+            f"{models or '(none)'}. Pull it with `ollama pull {model_name}` "
+            f"on that machine.")
+
+    print(f"LLM server ready: {url}"
+          + (f"; model={model_name}" if model_name else "")
+          + f"; {len(models)} model(s) available")
+    return models
+
 def LaunchLLMServer(
     partition="", nodelist=None, port=12321, num_parallel=2,
     model_name="gpt-oss:20b", job_name="ollama_server", log_dir="",
@@ -1037,12 +1073,141 @@ singularity exec --nv \\
     raise TimeoutError(f"Ollama did not become ready within {timeout_seconds} "
                        f"seconds. Job {job_id} was cancelled. Log: {log_path}")
 
+def LaunchLocalLLMServer(model_name="gpt-oss:20b", port=11434, num_parallel=2,
+                         log_dir="", timeout_seconds=600, host="127.0.0.1"):
+    """
+    Start an Ollama server on this machine and wait until it holds the model.
 
-def StopLLMServer(job_id):
-    """Cancel an LLM server job launched by LaunchLLMServer."""
-    import subprocess
-    subprocess.run(["scancel", str(job_id)], check=True)
-    print(f"Cancelled job {job_id}")
+    For a workstation or a single GPU box, anywhere there is no SLURM. The
+    return value has the same shape as LaunchLLMServer's, so nothing
+    downstream changes.
+
+    A server already listening on `port` is adopted rather than replaced: a
+    second `ollama serve` would fail on the bound address, and a server someone
+    else started is not this function's to take over.
+
+    OLLAMA_NUM_PARALLEL is read once at startup, so it applies only to a server
+    this call starts; an adopted one keeps whatever it was given. If the agents
+    run far slower than num_parallel suggests, that is the first thing to check.
+
+    Args:
+        model_name: Ollama model identifier, pulled if the server lacks it.
+        port: port to serve on. 11434 is Ollama's own default.
+        num_parallel: requests served at once. Match the agents' num_parallel.
+            More than the GPU's memory allows makes Ollama queue rather than
+            fail, which presents as slowness with nothing in the log.
+        log_dir: where ollama-server.log goes. The working directory if empty.
+        timeout_seconds: covers startup and the model pull together; a first
+            pull of a 20B model is several minutes on a fast link.
+        host: 127.0.0.1 keeps the server off the network. Use 0.0.0.0 only to
+            reach it from another machine, and only on a trusted one - Ollama
+            has no authentication.
+
+    Returns:
+        dict with model_name, ollama_url, num_parallel, pid and node, plus
+        reused=True when an existing server was adopted.
+    """
+    url = f"http://{host}:{port}"
+    log_path = Path(log_dir or ".") / "ollama-server.log"
+    pull_env = {**os.environ, "OLLAMA_HOST": f"{host}:{port}"}
+
+    try:
+        requests.get(f"{url}/api/tags", timeout=2).raise_for_status()
+        print(f"Ollama already listening at {url}; reusing it")
+        pid, reused = None, True
+    except requests.exceptions.RequestException:
+        if shutil.which("ollama") is None:
+            raise RuntimeError(
+                f"ollama is not on PATH and nothing answers at {url}. Install "
+                f"it with `curl -fsSL https://ollama.com/install.sh | sh`, or "
+                f"pass ollama_url to Setup.LLMConfig if a server runs "
+                f"somewhere else.")
+
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        env = {**pull_env, "OLLAMA_NUM_PARALLEL": str(num_parallel)}
+        # start_new_session so the server outlives the notebook kernel: a
+        # restart should not take a loaded 20B model down with it.
+        with open(log_path, "ab") as handle:
+            proc = subprocess.Popen(["ollama", "serve"], env=env,
+                                    stdout=handle, stderr=subprocess.STDOUT,
+                                    start_new_session=True)
+        pid, reused = proc.pid, False
+        print(f"Started ollama serve (pid {pid}); log: {log_path}", flush=True)
+
+        start = time.time()
+        while time.time() - start < timeout_seconds:
+            if proc.poll() is not None:
+                raise RuntimeError(
+                    f"ollama serve exited with code {proc.returncode}. "
+                    f"Log: {log_path}")
+            try:
+                requests.get(f"{url}/api/tags", timeout=2).raise_for_status()
+                break
+            except requests.exceptions.RequestException:
+                time.sleep(2)
+        else:
+            raise TimeoutError(
+                f"Ollama did not answer at {url} within {timeout_seconds}s. "
+                f"Log: {log_path}")
+
+    held = [m.get("name", "") for m in
+            requests.get(f"{url}/api/tags", timeout=10).json().get("models", [])]
+    if not any(m == model_name or m.startswith(f"{model_name}:") for m in held):
+        # Streamed to the notebook rather than captured: a multi-gigabyte
+        # download with no output is indistinguishable from a hang.
+        print(f"Pulling {model_name} ...", flush=True)
+        if subprocess.run(["ollama", "pull", model_name], env=pull_env).returncode:
+            raise RuntimeError(
+                f"`ollama pull {model_name}` failed. Check the name against "
+                f"`ollama list` or the model library.")
+
+    CheckLLMServer(url, model_name)
+    return {"model_name": model_name, "ollama_url": url,
+            "num_parallel": num_parallel, "pid": pid, "node": host,
+            "reused": reused}
+
+def StopLLMServer(server):
+    """
+    Stop a server started by LaunchLLMServer or LaunchLocalLLMServer.
+
+    Takes the dict either of them returned. A bare SLURM job id still works,
+    for notebooks written against the earlier signature. A server that was
+    already running when RareCollab found it is left alone - adopting one does
+    not make it ours to kill.
+    """
+    if not isinstance(server, dict):
+        subprocess.run(["scancel", str(server)], check=True)
+        print(f"Cancelled SLURM job {server}")
+        return
+
+    if server.get("job_id"):
+        subprocess.run(["scancel", str(server["job_id"])], check=True)
+        print(f"Cancelled SLURM job {server['job_id']}")
+        return
+
+    pid = server.get("pid")
+    if pid is None:
+        print("This server was already running when RareCollab found it; "
+              "leaving it alone.")
+        return
+
+    # The process group, not the process: start_new_session made it a leader,
+    # and ollama's model runners are its children.
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except ProcessLookupError:
+        print(f"Process {pid} is already gone")
+        return
+
+    for _ in range(20):
+        time.sleep(0.5)
+        try:
+            os.killpg(os.getpgid(pid), 0)
+        except ProcessLookupError:
+            print(f"Stopped ollama (pid {pid})")
+            return
+    os.killpg(os.getpgid(pid), signal.SIGKILL)
+    print(f"Stopped ollama (pid {pid}, needed SIGKILL)")
 
 def LLMConfig(model_name="gpt-oss:20b",
               ollama_url="http://127.0.0.1:12321",

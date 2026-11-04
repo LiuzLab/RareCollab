@@ -12,6 +12,7 @@ from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from ._lib._analysis import analysis_subdir, row_analysis
 
 #Default Key Parameters:
 LABEL_COL = "is_causal"
@@ -480,7 +481,7 @@ def filter_one(sample_id,  moe_path, expression_path, splicing_path, ase_path,
     # rule4: Potential New Disease Gene (Genetics)
     rule4 = (data["rank_Genetics"].le(10) & top100)
     # rule5: RNA-level Variant
-    rule5 = (data["Fraser_pvaluesBetaBinomial_jaccard"].lt(1e-5) | data["Outrider_pValue"].lt(1e-5)  & top100)
+    rule5 = ((data["Fraser_pvaluesBetaBinomial_jaccard"].lt(1e-5) | data["Outrider_pValue"].lt(1e-5)) & top100)
 
     #Calculate Mask
     mask = rule1 | rule2 | rule3 | rule4 | rule5
@@ -509,6 +510,8 @@ def filter_one(sample_id,  moe_path, expression_path, splicing_path, ase_path,
     candidate_data["evidence_rules"] = rule_columns.apply(_join_rule_labels, axis=1)
     candidate_data = candidate_data[final_mask]
     candidate_data = candidate_data[candidate_data["geneSymbol"]!="-"].copy()
+
+    candidate_data = candidate_data.drop(columns=["Start", "End"], errors="ignore")
 
     tmp = output_path.parent / f".{output_path.name}.tmp"
     candidate_data.to_feather(tmp)
@@ -545,7 +548,12 @@ def Candidates(samplesheet, work_dir, config=None, overwrite=False):
         for row in samplesheet.itertuples(index=True):
             sample_id = row.sampleID
             moe_path = Path(row.moe_score_path)
-            output_path = outpath / f"{sample_id}_nomcand.feather"
+            # Per row, not per patient: rule5 is OR'd into the candidate mask,
+            # so a patient analysed against two background cohorts has two
+            # candidate lists and neither contains the other.
+            out_dir = analysis_subdir(outpath, row_analysis(row))
+            out_dir.mkdir(parents=True, exist_ok=True)
+            output_path = out_dir / f"{sample_id}_nomcand.feather"
 
             # RNA paths optional — pass None if column missing or value NaN
             expr_path = _get_optional_path(row, "rna_expression_path")

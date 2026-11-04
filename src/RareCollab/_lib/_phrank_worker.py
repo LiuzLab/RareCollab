@@ -171,6 +171,15 @@ def prepare_phrank_resources(references):
         "phrank_instance": phrank_instance,
     }
 
+def phrank_output(sample_id, work_dir):
+    """
+    Where PHRANK_SCORING's output lands for one sample.
+
+    Shared with the parallel dispatcher so it can tell what is already done
+    without opening a process pool.
+    """
+    return (Path(work_dir) / "process_vcf" / str(sample_id)
+            / f"{sample_id}.phrank.txt")
 
 def PHRANK_SCORING(final_vcf_path, hpo_path, sample_id, work_dir, references,
                    interval_lookup=None, ensembl_to_symbol=None,
@@ -194,9 +203,8 @@ def PHRANK_SCORING(final_vcf_path, hpo_path, sample_id, work_dir, references,
     if not hpo_path.exists():
         raise FileNotFoundError(f"HPO file not found for sample {sample_id}: {hpo_path}")
 
-    sample_dir = work_dir / "process_vcf" / sample_id
-    sample_dir.mkdir(parents=True, exist_ok=True)
-    output_path = sample_dir / f"{sample_id}.phrank.txt"
+    output_path = phrank_output(sample_id, work_dir)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
         if output_path.exists() or output_path.is_symlink():
@@ -292,13 +300,28 @@ def run_phrank_parallel(samplesheet, work_dir, references, max_workers,
     phrank_results = {}
     ok = fail = 0
 
+    pending = []
+    for row in samplesheet.itertuples(index=True):
+        out = phrank_output(row.sampleID, work_dir)
+        if not overwrite and out.exists():
+            phrank_results[row.Index] = str(out)
+            continue
+        pending.append(row)
+
+    if not pending:
+        print(f"PHRANK SCORING: all {len(phrank_results)} sample(s) already computed.")
+        return phrank_results
+    if phrank_results:
+        print(f"PHRANK SCORING: {len(phrank_results)} sample(s) cached, "
+              f"{len(pending)} to compute.")
+
     with ProcessPoolExecutor(
-        max_workers=max_workers,
+        max_workers=min(max_workers, len(pending)),
         initializer=_init_worker,
         initargs=(references,),
         mp_context=mp.get_context("spawn"),
     ) as ex:
-        for row in samplesheet.itertuples(index=True):
+        for row in pending:
             future = ex.submit(
                 _phrank_worker_run,
                 row.final_vcf_path,

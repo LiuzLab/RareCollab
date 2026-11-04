@@ -113,6 +113,28 @@ If you cannot comply, output exactly:{{"Reasoning":"parse_error","Conclusion":"W
 """
     return prompt
 
+
+def ShowPrompt():
+    """
+    Print the prompt this agent sends, with the per-variant parts marked.
+
+    Rendered by the real builder so it cannot drift out of date. Not
+    configurable: the conclusion labels it defines are parsed downstream.
+
+    Shown with the SpliceAI line included; it is omitted for variants that are
+    not splice-consequential.
+    """
+    print(build_prompt_en(
+        identifier="<IDENTIFIER>",
+        variant_key="<CHROM_POS_REF_ALT>",
+        gene="<GENE>",
+        cdna_text="<HGVSc>",
+        protein_text="<HGVSp>",
+        score_lines=["- <score name>: <value>", "- <score name>: <value>"],
+        fathmm_note="<note on FATHMM score direction>",
+        include_spliceai=True,
+    ))
+    
 # ===== Per-variant LLM worker =====
 
 def insilico_llm_one(model_name, ollama_url, temperature,
@@ -126,8 +148,12 @@ def insilico_llm_one(model_name, ollama_url, temperature,
     output_dir.mkdir(parents=True, exist_ok=True)
     output_txt = output_dir / f"{varId}.txt"
     output_json = output_dir / f"{varId}.json"
+    prompt_path = llm_res_dir / "Prompt" / identifier / f"{varId}.txt"
 
-    if output_json.exists() and not overwrite:
+    # Prompt and answer checked separately: a result from before prompts were
+    # kept gets its prompt on the next run without another inference.
+    have_answer = output_json.exists() and not overwrite
+    if have_answer and prompt_path.exists():
         return 1
 
     include_spliceai = int(row.is_splice_cons) > 0
@@ -145,6 +171,15 @@ def insilico_llm_one(model_name, ollama_url, temperature,
         score_lines=score_lines, fathmm_note=fathmm_note,
         include_spliceai=include_spliceai,
     )
+
+    if not prompt_path.exists():
+        prompt_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_prompt = prompt_path.parent / f".{prompt_path.name}.tmp"
+        tmp_prompt.write_text(prompt_text, encoding="utf-8")
+        os.replace(tmp_prompt, prompt_path)
+
+    if have_answer:
+        return 1
 
     payload = {
         "model": model_name,

@@ -6,10 +6,12 @@ import json
 import numpy as np
 import pandas as pd
 import pysam
+from tqdm import tqdm
 from pathlib import Path
 from collections import defaultdict
 from itertools import combinations
-from tqdm import tqdm
+from ._lib._analysis import DEFAULT_ANALYSIS, analysis_subdir, row_analysis
+
 
 
 # ============================================================
@@ -615,19 +617,41 @@ def PairWiseComp(data, tier=(1, 2), sampleid=""):
     return res_df, pk_log_df
 
 
+def _prompt_paths(prompt_dir, keys):
+    """
+    One prompt file per key, blank where none was written.
+
+    The directory is listed once and matched in memory rather than stat'ed per
+    row: the candidate table carries one row per transcript, so the same gene
+    or variant repeats many times over.
+    """
+    prompt_dir = Path(prompt_dir)
+    keys = keys.astype(str)
+    if not prompt_dir.is_dir():
+        return pd.Series([""] * len(keys), index=keys.index)
+    present = {p.name for p in prompt_dir.iterdir() if p.is_file()}
+    return keys.map(lambda k: str(prompt_dir / f"{k}.txt")
+                    if f"{k}.txt" in present else "")
+
 # ============================================================
 # Per-sample review worker
 # ============================================================
 
 def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
-                       output_dir, overwrite=False):
+                       database_prompt_dir, output_dir, analysis_name=DEFAULT_ANALYSIS,
+                       overwrite=False):
     """
     Review one sample's variants: load all agent outputs, classify Tier,
     detect compound het, run pairwise comparison, write final CSV.
+
+    The DNA agent readings are per variant and per gene and are shared across
+    analyses; everything downstream of the candidate list is not, so the RNA
+    agent outputs and the report itself sit under the analysis folder.
     """
-    output_csv = output_dir / f"{sample_id}.csv"
+    output_csv = analysis_subdir(output_dir, analysis_name) / f"{sample_id}.csv"
     if output_csv.exists() and not overwrite:
         return 1
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
 
     work_dir = Path(work_dir)
     candidates_path = Path(candidates_path)
@@ -635,7 +659,7 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
     # Build per-sample agent paths from RareCollab work dir structure
     input_root_phenotype = work_dir / "Agents" / "Phenotype" / "AgentEvaluation"
     input_root_insilico = work_dir / "Agents" / "InSilico" / "AgentEvaluation"
-    input_root_rna = work_dir / "Agents" / "RNA"
+    input_root_rna = analysis_subdir(work_dir / "Agents" / "RNA", analysis_name)
 
     sub_hpo_path = input_root_phenotype / "HPO_Agent" / sample_id
     sub_omim_path = input_root_phenotype / "OMIM_Agent" / sample_id
@@ -646,6 +670,24 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
 
     # Load data
     data = pd.read_feather(candidates_path).reset_index(drop=True)
+    # Prompt paths, so the exact text each agent was given is recoverable from
+    # the row. Paths rather than the text: a prompt runs to several kilobytes
+    # and carries newlines and quotes, which is three ways to make a CSV
+    # unreadable, and nobody sorts or filters on a prompt. Whoever needs the
+    # text - the results viewer, an audit - reads the file.
+    gene_keys = data["geneSymbol"]
+    var_keys = data["varId"]
+    for column, directory, keys in (
+        ("Database_Prompt_Path", database_prompt_dir, var_keys),
+        ("Insilico_Prompt_Path", input_root_insilico / "Prompt" / sample_id, var_keys),
+        ("HPO_Prompt_Path", input_root_phenotype / "HPO_Agent" / "Prompt" / sample_id, gene_keys),
+        ("OMIM_Prompt_Path", input_root_phenotype / "OMIM_Agent" / "Prompt" / sample_id, gene_keys),
+        ("Literature_Prompt_Path", input_root_phenotype / "Literature_Agent" / "Prompt" / sample_id, gene_keys),
+        ("RNA_GeneLevel_Prompt_Path", input_root_rna / "Prompt_Gene" / sample_id, gene_keys),
+        ("RNA_VarLevel_Prompt_Path",  input_root_rna / "Prompt_Variant" / sample_id, gene_keys.astype(str) + "_VarId_" + var_keys.astype(str)),
+    ):
+        data[column] = _prompt_paths(directory, keys)
+
     HPO_res = load_LLM_res(sub_hpo_path, model_type='HPO', candidate_type='geneSymbol')
     OMIM_res = load_LLM_res(sub_omim_path, model_type='OMIM', candidate_type='geneSymbol')
     Lit_res = load_LLM_res(sub_lit_path, model_type='Literature', candidate_type='geneSymbol')
@@ -677,7 +719,7 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
             'geneSymbol', 'varId',
         ])
     
-    AQ_path = work_dir / "Agents" / "RNA" / "AlleleQuantification" / f"{sample_id}.feather"
+    AQ_path = input_root_rna / "AlleleQuantification" / f"{sample_id}.feather"
     aq_cols = ['ref_count_max', 'ref_count_mean', 'ref_count_min',
                'alt_count_max', 'alt_count_mean', 'alt_count_min']
     if AQ_path.exists():
@@ -736,8 +778,8 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
     data['has_repeat_motif'] = TandemRepeats['has_repeat_motif']
 
     # Tier classification flags
-    data['misscall_rna_flag'] = True
-    data.loc[(data['ref_count_mean'] > 20) & (data['alt_count_min'] == 0), 'misscall_rna_flag'] = False
+    data['rna_confirms_call_flag'] = True
+    data.loc[(data['ref_count_mean'] > 20) & (data['alt_count_min'] == 0), 'rna_confirms_call_flag'] = False
 
     data['new_diseasegene_flag'] = True
     data.loc[
@@ -763,7 +805,7 @@ def _review_one_sample(sample_id, candidates_path, work_dir, fa, database_res,
 
     data['Tier'] = 2
     data.loc[
-        data['misscall_rna_flag'] & (~data['has_repeat_motif']) &
+        data['rna_confirms_call_flag'] & (~data['has_repeat_motif']) &
         data['new_diseasegene_flag'] & data['omim_flag'] & data['strong_nom_flag'],
         'Tier'
     ] = 1
@@ -905,6 +947,15 @@ def Review(samplesheet, work_dir, fasta_references, output_path, overwrite=False
             Caller passes fasta_references.fasta; see usage below.
         output_path: Directory to write per-sample CSV reports.
         overwrite: Re-run even if outputs exist.
+    
+    Returns:
+        - Write per-sample CSV report to output_path.
+        - Write RareCollabViewerInput.csv alongside them: one row per patient
+          and analysis. A patient measured against two background cohorts has
+          two reports, so they get two rows; analysis_name is left blank for
+          the default analysis, which is every patient when no cohort was
+          split.
+
     """
     work_dir = Path(work_dir)
     output_path = Path(output_path)
@@ -934,10 +985,12 @@ def Review(samplesheet, work_dir, fasta_references, output_path, overwrite=False
     if len(db_agent_root) == 0:
         raise ValueError("No database_agent_root in samplesheet. Run DatabaseAgent.RunAgent first.")
     input_root_database = Path(db_agent_root[0]) / "AgentEvaluation" / "json"
+    database_prompt_dir = Path(db_agent_root[0]) / "AgentEvaluation" / "Prompt"
     print(f"Loading Database Agent results from {input_root_database}")
     database_res = load_DatabaseLLM_res(input_root_database)
 
-    print(f"Reviewing {len(samplesheet)} samples ...")
+    print(f"Reviewing {len(samplesheet)} row(s) for "
+          f"{samplesheet['sampleID'].nunique()} patient(s) ...")
     pbar = tqdm(samplesheet.itertuples(index=True), total=len(samplesheet), desc="Reviewing Cases")
     ok = fail = 0
     for row in pbar:
@@ -950,7 +1003,9 @@ def Review(samplesheet, work_dir, fasta_references, output_path, overwrite=False
                 work_dir=work_dir,
                 fa=fa,
                 database_res=database_res,
+                database_prompt_dir=database_prompt_dir,
                 output_dir=output_path,
+                analysis_name=row_analysis(row),
                 overwrite=overwrite,
             )
             ok += 1
@@ -963,11 +1018,42 @@ def Review(samplesheet, work_dir, fasta_references, output_path, overwrite=False
 
     # Update samplesheet with output path
     samplesheet = samplesheet.copy()
-    samplesheet["integration_report_path"] = samplesheet["sampleID"].apply(
-        lambda sid: str(output_path / f"{sid}.csv")
-    )
+    samplesheet["integration_report_path"] = [
+        str(analysis_subdir(output_path, row_analysis(row)) / f"{row.sampleID}.csv")
+        for row in samplesheet.itertuples(index=False)]
+
+    # to_numpy on the two Series, and a plain list for the third: the
+    # samplesheet's index survives upstream copies and filters, so mixing an
+    # indexed Series with a positional list here would align them by label and
+    # quietly blank out every row whose index is not 0..n-1.
+    manifest = pd.DataFrame({
+        "patient_id": samplesheet["sampleID"].astype(str).to_numpy(),
+        # Blank rather than the default name: a user who never split their
+        # cohort should see an empty column, not a word they never chose.
+        # row_analysis reads a blank cell back as the default, so a manifest
+        # fed back into the pipeline still resolves.
+        "analysis_name": [
+            "" if row_analysis(row) == DEFAULT_ANALYSIS else row_analysis(row)
+            for row in samplesheet.itertuples(index=False)],
+        "output_path": samplesheet["integration_report_path"].astype(str).to_numpy(),
+    })
+    manifest = manifest.loc[
+        manifest["output_path"].map(lambda p: Path(p).is_file())
+    ].reset_index(drop=True)
+
+    manifest_path = output_path / "RareCollabViewerInput.csv"
+    tmp = output_path / f".{manifest_path.name}.tmp"
+    manifest.to_csv(tmp, index=False)
+    os.replace(tmp, manifest_path)
+
+    print(f"Viewer manifest: {manifest_path} ({len(manifest)} report(s) for "
+          f"{manifest['patient_id'].nunique()} patient(s))")
+    if len(manifest) < len(samplesheet):
+        print(f"  WARNING: {len(samplesheet) - len(manifest)} sample(s) have no "
+              f"report on disk and were left out")
 
     samplesheet_path = work_dir / "samplesheet_with_paths.csv"
+
     tmp = work_dir / ".samplesheet_with_paths.csv.tmp"
     samplesheet.to_csv(tmp, index=False)
     os.replace(tmp, samplesheet_path)

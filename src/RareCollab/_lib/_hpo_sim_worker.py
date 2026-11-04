@@ -167,6 +167,15 @@ def prepare_hpo_resources(references):
         "ancestors_sparse": ancestors_sparse,
     }
 
+def hpo_sim_outputs(sample_id, work_dir):
+    """
+    Where HPO_SIM's two outputs land for one sample: (hgmd_sim, omim_sim).
+
+    Shared with the parallel dispatcher so it can tell what is already done
+    without opening a process pool, and so the two cannot drift apart.
+    """
+    sample_dir = Path(work_dir) / "features" / str(sample_id)
+    return sample_dir / f"{sample_id}-cz", sample_dir / f"{sample_id}-dx"
 
 def HPO_SIM(hpo_path, sample_id, work_dir, references, hpo_resources, overwrite=True):
     """
@@ -182,11 +191,8 @@ def HPO_SIM(hpo_path, sample_id, work_dir, references, hpo_resources, overwrite=
             f"HPO file not found for sample {sample_id}: {hpo_path}"
         )
 
-    sample_dir = work_dir / "features" / sample_id
-    sample_dir.mkdir(parents=True, exist_ok=True)
-
-    output_cz = sample_dir / f"{sample_id}-cz"
-    output_dx = sample_dir / f"{sample_id}-dx"
+    output_cz, output_dx = hpo_sim_outputs(sample_id, work_dir)
+    output_cz.parent.mkdir(parents=True, exist_ok=True)
 
     if overwrite:
         for p in [output_cz, output_dx]:
@@ -319,13 +325,29 @@ def run_hpo_sim_parallel(samplesheet, work_dir, references, max_workers, overwri
     hpo_results = {}
     ok = fail = 0
 
+    pending = []
+    for row in samplesheet.itertuples(index=True):
+        cz, dx = hpo_sim_outputs(row.sampleID, work_dir)
+        if not overwrite and cz.exists() and dx.exists():
+            hpo_results[row.Index] = {"hgmd_sim_path": str(cz),
+                                      "omim_sim_path": str(dx)}
+            continue
+        pending.append(row)
+    
+    if not pending:
+        print(f"HPO SIM: all {len(hpo_results)} sample(s) already computed.")
+        return hpo_results
+    if hpo_results:
+        print(f"HPO SIM: {len(hpo_results)} sample(s) cached, "
+              f"{len(pending)} to compute.")
+
     with ProcessPoolExecutor(
-        max_workers=max_workers,
+        max_workers=min(max_workers, len(pending)),
         initializer=_init_worker,
         initargs=(references,),
         mp_context=mp.get_context("spawn"),
     ) as ex:
-        for row in samplesheet.itertuples(index=True):
+        for row in pending:
             future = ex.submit(
                 _hpo_sim_worker_run,
                 row.hpo_path,
