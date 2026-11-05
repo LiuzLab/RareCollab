@@ -353,6 +353,25 @@ def _parse_numeric(val_str, select="min"):
     vals = [float(i) for i in vals]
     return select_method[select](vals)
 
+def _split_select(series, pick):
+    """
+    Reduce each comma-joined score string to a single value.
+
+    Replaces a per-row loop that read and wrote through DataFrame.loc. On a
+    frame this wide, with every column still object dtype at this point, each
+    scalar .loc costs far more than the parsing it surrounds, and it is paid
+    once per variant.
+
+    Semantics are unchanged: '-' and '.' are dropped, an entry left with no
+    numbers becomes NaN, and `pick` (max or min) chooses among the rest.
+    """
+    def one(value):
+        if pd.isna(value):
+            return np.nan
+        scores = [float(x) for x in str(value).split(",") if x != "-" and x != "."]
+        return pick(scores) if scores else np.nan
+
+    return series.map(one)
 
 def _feature_engineering(score_file, tier_file, feature_stats):
     """
@@ -494,10 +513,7 @@ def _feature_engineering(score_file, tier_file, feature_stats):
 
     # REVEL_score: split commas, max
     patient.loc[patient["REVEL_score"] == "-", "REVEL_score"] = np.nan
-    for i in patient[~patient["REVEL_score"].isna()].index:
-        score_list = str(patient.loc[i, "REVEL_score"]).split(",")
-        score_list = [float(x) for x in score_list if x != "-" and x != "."]
-        patient.loc[i, "REVEL_score"] = np.nan if not score_list else max(score_list)
+    patient["REVEL_score"] = _split_select(patient["REVEL_score"], max)
     _fill_numeric("REVEL_score", "min", "mean")
 
     _fill_numeric("fathmm_MKL_coding_score", "min", "mean")
@@ -511,18 +527,12 @@ def _feature_engineering(score_file, tier_file, feature_stats):
     # Polyphen2_HDIV_score: split, max
     for col in ["Polyphen2_HDIV_score", "Polyphen2_HVAR_score"]:
         patient.loc[patient[col] == "-", col] = np.nan
-        for i in patient[~patient[col].isna()].index:
-            score_list = str(patient.loc[i, col]).split(",")
-            score_list = [float(x) for x in score_list if x != "-" and x != "."]
-            patient.loc[i, col] = np.nan if not score_list else max(score_list)
+        patient[col] = _split_select(patient[col], max)
         _fill_numeric(col, "min", "50%")
 
     # SIFT_score: split, min (lower is more deleterious)
     patient.loc[patient["SIFT_score"] == "-", "SIFT_score"] = np.nan
-    for i in patient[~patient["SIFT_score"].isna()].index:
-        score_list = str(patient.loc[i, "SIFT_score"]).split(",")
-        score_list = [float(x) for x in score_list if x != "-" and x != "."]
-        patient.loc[i, "SIFT_score"] = np.nan if not score_list else min(score_list)
+    patient["SIFT_score"] = _split_select(patient["SIFT_score"], min)
     _fill_numeric("SIFT_score", "max", "50%")
 
     zyg_map = {"HET": 1, "HOM": 2, "-": 0}
@@ -532,20 +542,14 @@ def _feature_engineering(score_file, tier_file, feature_stats):
 
     # FATHMM_score: split, min
     patient.loc[patient["FATHMM_score"] == "-", "FATHMM_score"] = np.nan
-    for i in patient[~patient["FATHMM_score"].isna()].index:
-        score_list = str(patient.loc[i, "FATHMM_score"]).split(",")
-        score_list = [float(x) for x in score_list if x != "-" and x != "."]
-        patient.loc[i, "FATHMM_score"] = np.nan if not score_list else min(score_list)
+    patient["FATHMM_score"] = _split_select(patient["FATHMM_score"], min)
     _fill_numeric("FATHMM_score", "max", "50%")
 
     _fill_numeric("M_CAP_score", "min", "mean")
 
     # MutationAssessor_score: split, max
     patient.loc[patient["MutationAssessor_score"] == "-", "MutationAssessor_score"] = np.nan
-    for i in patient[~patient["MutationAssessor_score"].isna()].index:
-        score_list = str(patient.loc[i, "MutationAssessor_score"]).split(",")
-        score_list = [float(x) for x in score_list if x != "-" and x != "."]
-        patient.loc[i, "MutationAssessor_score"] = np.nan if not score_list else max(score_list)
+    patient["MutationAssessor_score"] = _split_select(patient["MutationAssessor_score"], max)
     _fill_numeric("MutationAssessor_score", "min", "50%")
 
     for col in ["ESP6500_AA_AF", "ESP6500_EA_AF"]:
@@ -554,10 +558,7 @@ def _feature_engineering(score_file, tier_file, feature_stats):
 
     # hom: split, max, fillna 0
     patient.loc[patient["hom"] == "-", "hom"] = np.nan
-    for i in patient[~patient["hom"].isna()].index:
-        score_list = str(patient.loc[i, "hom"]).split(",")
-        score_list = [float(x) for x in score_list if x != "-" and x != "."]
-        patient.loc[i, "hom"] = np.nan if not score_list else max(score_list)
+    patient["hom"] = _split_select(patient["hom"], max)
     patient["hom"] = pd.to_numeric(patient["hom"], errors="coerce").fillna(0).astype("float64")
 
     patient["hgmd_rs"] = patient["hgmd_rs"].apply(

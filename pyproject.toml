@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "RareCollab"
-version = "2.0.0"
+version = "2.0.1"
 description = "RareCollab - A Multimodal Diagnostic Copilot for Mendelian Disorders"
 license = "GPL-3.0-only"
 license-files = ["LICENSE"]
